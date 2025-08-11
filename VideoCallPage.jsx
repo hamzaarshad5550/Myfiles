@@ -1,14 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { Video, VideoOff, Mic, MicOff, Phone, PhoneOff, Settings } from 'lucide-react';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { Video, VideoOff, Mic, MicOff, Phone, PhoneOff } from 'lucide-react';
 import { WEBHOOK_CONFIG } from '../config/webhooks';
 
 const VideoCallPage = ({ identityPrefix }) => {
-  const { roomName } = useParams(); // /video-call/:roomName or /practice-call/:roomName
+  const { roomName } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
   const videoRef = useRef();
   const localVideoRef = useRef();
-  
+
   // State management
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -29,20 +30,22 @@ const VideoCallPage = ({ identityPrefix }) => {
       try {
         setIsConnecting(true);
         setConnectionStatus('Connecting to video call...');
-        
-        // Generate unique identity
-        const identity = `${identityPrefix}_${Math.floor(Math.random() * 10000)}`;
-        
+
+        // Parse identity from URL query param or fallback to random
+        const queryParams = new URLSearchParams(location.search);
+        const queryIdentity = queryParams.get('identity');
+        const identity = queryIdentity || `${identityPrefix}_${Math.floor(Math.random() * 10000)}`;
+
         console.log(`🎥 ${userType} joining room:`, roomName, 'with identity:', identity);
 
         // Get token from backend
         const response = await fetch(WEBHOOK_CONFIG.VIDEO_TOKEN_API, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            identity, 
+          body: JSON.stringify({
+            identity,
             roomName,
-            userType: identityPrefix 
+            userType: identityPrefix,
           }),
         });
 
@@ -55,14 +58,14 @@ const VideoCallPage = ({ identityPrefix }) => {
 
         // Import Twilio Video dynamically
         const Video = await import('twilio-video');
-        
+
         setConnectionStatus('Joining room...');
-        
+
         // Connect to room
-        const connectedRoom = await Video.connect(token, { 
+        const connectedRoom = await Video.connect(token, {
           name: roomName,
           audio: isAudioEnabled,
-          video: isVideoEnabled
+          video: isVideoEnabled,
         });
 
         console.log('✅ Connected to room:', connectedRoom.name);
@@ -116,7 +119,6 @@ const VideoCallPage = ({ identityPrefix }) => {
             }
           });
         });
-
       } catch (error) {
         console.error('❌ Video call error:', error);
         setError(error.message);
@@ -135,9 +137,9 @@ const VideoCallPage = ({ identityPrefix }) => {
         room.disconnect();
       }
     };
-  }, [roomName, identityPrefix]);
+  }, [roomName, identityPrefix, location.search]);
 
-  const handleParticipantConnected = (participant) => {
+  const handleParticipantConnected = participant => {
     setParticipants(prev => [...prev, participant]);
 
     participant.tracks.forEach(publication => {
@@ -155,9 +157,9 @@ const VideoCallPage = ({ identityPrefix }) => {
     });
   };
 
-  const handleParticipantDisconnected = (participant) => {
+  const handleParticipantDisconnected = participant => {
     setParticipants(prev => prev.filter(p => p.sid !== participant.sid));
-    
+
     participant.tracks.forEach(publication => {
       if (publication.track) {
         detachTrack(publication.track);
@@ -165,7 +167,7 @@ const VideoCallPage = ({ identityPrefix }) => {
     });
   };
 
-  const attachTrack = (track) => {
+  const attachTrack = track => {
     if (videoRef.current) {
       const mediaElement = track.attach();
       mediaElement.style.width = '100%';
@@ -175,7 +177,7 @@ const VideoCallPage = ({ identityPrefix }) => {
     }
   };
 
-  const detachTrack = (track) => {
+  const detachTrack = track => {
     track.detach().forEach(element => {
       element.remove();
     });
@@ -249,9 +251,11 @@ const VideoCallPage = ({ identityPrefix }) => {
             <p className="text-sm opacity-75">Status: {connectionStatus}</p>
           </div>
           <div className="flex items-center space-x-2">
-            <span className={`px-3 py-1 rounded-full text-xs ${
-              isConnected ? 'bg-green-500' : isConnecting ? 'bg-yellow-500' : 'bg-red-500'
-            }`}>
+            <span
+              className={`px-3 py-1 rounded-full text-xs ${
+                isConnected ? 'bg-green-500' : isConnecting ? 'bg-yellow-500' : 'bg-red-500'
+              }`}
+            >
               {isConnected ? 'Connected' : isConnecting ? 'Connecting...' : 'Disconnected'}
             </span>
           </div>
@@ -261,10 +265,7 @@ const VideoCallPage = ({ identityPrefix }) => {
       {/* Video Container */}
       <div className="relative w-full h-screen">
         {/* Remote participants video */}
-        <div 
-          ref={videoRef} 
-          className="w-full h-full bg-gray-800 flex items-center justify-center"
-        >
+        <div ref={videoRef} className="w-full h-full bg-gray-800 flex items-center justify-center">
           {!isConnected && !isConnecting && (
             <div className="text-white text-center">
               <div className="text-6xl mb-4">📹</div>
@@ -281,10 +282,7 @@ const VideoCallPage = ({ identityPrefix }) => {
 
         {/* Local video (picture-in-picture) */}
         <div className="absolute top-20 right-4 w-48 h-36 bg-gray-700 rounded-lg overflow-hidden border-2 border-white shadow-lg">
-          <div 
-            ref={localVideoRef} 
-            className="w-full h-full bg-gray-600 flex items-center justify-center"
-          >
+          <div ref={localVideoRef} className="w-full h-full bg-gray-600 flex items-center justify-center">
             {!isVideoEnabled && (
               <div className="text-white text-center">
                 <VideoOff size={24} />
@@ -302,9 +300,7 @@ const VideoCallPage = ({ identityPrefix }) => {
           <button
             onClick={toggleAudio}
             className={`p-4 rounded-full transition-colors ${
-              isAudioEnabled 
-                ? `bg-${themeColor}-500 hover:bg-${themeColor}-600` 
-                : 'bg-red-500 hover:bg-red-600'
+              isAudioEnabled ? `bg-${themeColor}-500 hover:bg-${themeColor}-600` : 'bg-red-500 hover:bg-red-600'
             }`}
           >
             {isAudioEnabled ? <Mic className="text-white" size={24} /> : <MicOff className="text-white" size={24} />}
@@ -314,19 +310,14 @@ const VideoCallPage = ({ identityPrefix }) => {
           <button
             onClick={toggleVideo}
             className={`p-4 rounded-full transition-colors ${
-              isVideoEnabled 
-                ? `bg-${themeColor}-500 hover:bg-${themeColor}-600` 
-                : 'bg-red-500 hover:bg-red-600'
+              isVideoEnabled ? `bg-${themeColor}-500 hover:bg-${themeColor}-600` : 'bg-red-500 hover:bg-red-600'
             }`}
           >
             {isVideoEnabled ? <Video className="text-white" size={24} /> : <VideoOff className="text-white" size={24} />}
           </button>
 
           {/* End Call */}
-          <button
-            onClick={endCall}
-            className="p-4 rounded-full bg-red-500 hover:bg-red-600 transition-colors"
-          >
+          <button onClick={endCall} className="p-4 rounded-full bg-red-500 hover:bg-red-600 transition-colors">
             <PhoneOff className="text-white" size={24} />
           </button>
         </div>
@@ -335,7 +326,9 @@ const VideoCallPage = ({ identityPrefix }) => {
       {/* Participants Count */}
       {participants.length > 0 && (
         <div className="absolute top-20 left-4 bg-black bg-opacity-50 text-white px-3 py-2 rounded-lg">
-          <p className="text-sm">👥 {participants.length + 1} participant{participants.length > 0 ? 's' : ''}</p>
+          <p className="text-sm">
+            👥 {participants.length + 1} participant{participants.length > 0 ? 's' : ''}
+          </p>
         </div>
       )}
     </div>

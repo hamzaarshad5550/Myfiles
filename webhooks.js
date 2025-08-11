@@ -38,7 +38,7 @@ const ENVIRONMENT_CONFIG = {
   local: {
     N8N_BASE_URL: 'https://local-n8n.vitonta.com',
     WEBHOOK_PATH: '/webhook/115d0f35-6f15-4b38-9697-a702343ceccd',
-    API_BASE_URL: 'https://ooh_web.vitonta.com'
+    API_BASE_URL: 'https://localhost:44360' //'https://ooh_web.vitonta.com'
   },
   production: {
     N8N_BASE_URL: 'https://demo-ooh-n8n.vitonta.com',
