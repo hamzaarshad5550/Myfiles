@@ -113,7 +113,7 @@ const StripePayment = ({
       console.log('📞 Calling n8n workflow to create payment intent...');
 
       const paymentIntentPayload = {
-        "workflowtype": "create_payment_intent",
+        "workflowtype": "stripe",
         "type": "create_payment_intent",
         "stripe_amount": Math.round(amount * 100), // Dynamic amount in cents
         "stripe_currency": "EUR",

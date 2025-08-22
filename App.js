@@ -1010,6 +1010,7 @@ export default function CareHQBooking() {
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
   const [paymentError, setPaymentError] = useState(null);
   const [paymentSuccess, setPaymentSuccess] = useState(false);
+  const [stripePaymentData, setStripePaymentData] = useState(null); // Store Stripe payment data for ccTrnNo and trnDate
 
   // Add state for API loading
   const [isSavingPatient, setIsSavingPatient] = useState(false);
@@ -1957,10 +1958,29 @@ export default function CareHQBooking() {
     setPaymentError(null);
 
     try {
+      // Extract Stripe payment data for ccTrnNo and trnDate
+      const stripeData = paymentResult.stripeData || {};
+      const paymentIntent = stripeData.paymentIntent || paymentResult.paymentIntent?.id || '';
+      const createdAt = stripeData.createdAt || paymentResult.paymentIntent?.created
+        ? new Date(paymentResult.paymentIntent.created * 1000).toISOString()
+        : new Date().toISOString();
+
+      console.log('💳 Extracted Stripe data for booking:', {
+        paymentIntent,
+        createdAt,
+        fullPaymentResult: paymentResult
+      });
+
+      // Store Stripe payment data for later use
+      setStripePaymentData({
+        ccTrnNo: paymentIntent,
+        trnDate: createdAt
+      });
+
       // Make final booking confirmation call after successful payment
       if (reservedAppointment?.AppointmentID && patientID && reservedAppointment?.VisitID) {
         console.log('🔄 Making final booking confirmation call after payment...');
-        
+
         const confirmationPayload = {
           "workflowtype": "book_appointment",
           "PatientID": patientID,
@@ -1972,7 +1992,9 @@ export default function CareHQBooking() {
           "EndTime": reservedAppointment.EndTime,
           "Status": true, // True to confirm booking after payment
           "Email": formData.email || "",
-          "VideoURL": ""
+          "VideoURL": "",
+          "ccTrnNo": paymentIntent, // Payment intent from Stripe
+          "trnDate": createdAt // Transaction date from Stripe
         };
 
         console.log('📤 Final booking confirmation payload:', confirmationPayload);
@@ -2191,7 +2213,9 @@ export default function CareHQBooking() {
         "StartTime": reservedAppointment.StartTime,
         "EndTime": reservedAppointment.EndTime,
         "Status": true,
-        "VideoURL": ""
+        "VideoURL": "",
+        "ccTrnNo": stripePaymentData?.ccTrnNo || "", // Payment intent from Stripe
+        "trnDate": stripePaymentData?.trnDate || null // Transaction date from Stripe
       };
 
       console.log('📤 Directions request payload:', directionsPayload);
@@ -2974,6 +2998,7 @@ export default function CareHQBooking() {
     setPaymentAmount(DEFAULT_CONSULTATION_FEE); // Reset to default, will be updated from API
     setPaymentError(null);
     setPaymentSuccess(false);
+    setStripePaymentData(null); // Reset Stripe payment data
     setValidationErrors({});
     setShowValidationErrors(false);
     setBookingError('');
@@ -4129,7 +4154,9 @@ export default function CareHQBooking() {
         AppointmentID: 0, // Always 0 for new reservations
         StartTime: startTime,
         EndTime: endTime,
-        Status: false // Always false for initial reservation
+        Status: false, // Always false for initial reservation
+        ccTrnNo: "", // Empty for initial reservation (no payment yet)
+        trnDate: null // Null for initial reservation (no payment yet)
       };
 
       console.log('📤 Slot reservation payload:', reservationPayload);
@@ -4716,7 +4743,9 @@ const bookAppointment = async (patientID, visitID) => {
     "AppointmentID": 0,
     "StartTime": startDateTime.toISOString(),
     "EndTime": endDateTime.toISOString(),
-    "Status": false
+    "Status": false,
+    "ccTrnNo": "", // Empty for initial booking (no payment yet)
+    "trnDate": null // Null for initial booking (no payment yet)
   };
 
   console.log('📅 Booking appointment with payload:', bookingPayload);
@@ -6661,7 +6690,6 @@ const handleContinueToBooking = async () => {
     </div>
   );
 }
-
 
 
 
