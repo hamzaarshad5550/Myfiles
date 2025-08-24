@@ -19,6 +19,7 @@ import { languages, translations, getTranslation, saveLanguageToStorage, getLang
 import PhoneNumberInput from './components/PhoneNumberInput';
 import SendSms from './components/SendSms';
 import EmergencyNotice from './components/EmergencyNotice.tsx';
+import { Toaster } from 'react-hot-toast';
 
 // CSS imports
 import './styles/flags.css';
@@ -4856,8 +4857,27 @@ const handleContinueToBooking = async () => {
 
   return (
     <div className="min-h-screen bg-gray-50 relative w-full overflow-x-hidden">
+      {/* Toast notifications */}
+      <Toaster
+        position="top-right"
+        toastOptions={{
+          duration: 4000,
+          style: {
+            background: '#363636',
+            color: '#fff',
+          },
+          success: {
+            duration: 3000,
+            theme: {
+              primary: 'green',
+              secondary: 'black',
+            },
+          },
+        }}
+      />
+
       {/* Mobile-first responsive container */}
-      
+
 
       {/* Add top padding to main content to account for fixed header */}
 <div className="pt-16">
