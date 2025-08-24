@@ -95,32 +95,39 @@ const VideoCallPage = ({ identityPrefix }) => {
   const triggerDownloadViaFetch = async (url, suggestedFilename) => {
     try {
       setStatus('Downloading recording...');
-      
+
+      // Use the appropriate SID for download
+      const sidToUse = compositionSid || recordingSid;
+
       const downloadResp = await fetch(`${normalizedBackendUrl}/api/video/download-recording`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          mediaUrl: url,
-          recordingSid: recordingSid
+        body: JSON.stringify({
+          mediaUrl: url !== `${normalizedBackendUrl}/api/video/download-recording` ? url : undefined,
+          recordingSid: sidToUse
         })
       });
-      
+
       if (!downloadResp.ok) {
         const errorText = await downloadResp.text();
         throw new Error(`Download failed: ${downloadResp.status} ${errorText}`);
       }
-      
+
       const blob = await downloadResp.blob();
+      if (blob.size === 0) {
+        throw new Error('Downloaded file is empty');
+      }
+
       const blobUrl = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = blobUrl;
-      a.download = suggestedFilename || `recording_${compositionSid || recordingSid || Date.now()}.mp4`;
+      a.download = suggestedFilename || `recording_${sidToUse || Date.now()}.mp4`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       window.URL.revokeObjectURL(blobUrl);
-      setStatus('Download started');
-      toast.success('Download started.');
+      setStatus('Download completed');
+      toast.success('Download completed successfully!');
     } catch (err) {
       console.error('triggerDownload error:', err);
       setStatus('Download failed.');
@@ -168,25 +175,30 @@ const VideoCallPage = ({ identityPrefix }) => {
   const checkRecordingStatus = async () => {
     try {
       let sid = recordingType === 'recording' ? recordingSid : compositionSid;
-      if (!sid) return;
+      if (!sid) {
+        console.log('No SID available for status check');
+        return;
+      }
 
+      console.log(`Checking status for ${recordingType} SID: ${sid}`);
       const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}?type=${recordingType}`);
       if (res.ok) {
         const data = await res.json();
+        console.log('Recording status response:', data);
         setRecordingStatus(data.status);
-        
-        if (data.status === 'completed' && data.downloadUrl) {
-          setDownloadUrl(data.downloadUrl);
+
+        if (data.status === 'completed') {
+          setDownloadUrl(data.downloadUrl || `${normalizedBackendUrl}/api/video/download-recording`);
           setIsRecording(false);
-          setStatus('Recording complete. Ready for download.');
-          toast.success('Recording ready for download.');
+          setStatus(`Recording complete (${data.duration || 0}s). Ready for download.`);
+          toast.success('Recording ready for download!');
           if (recordingCheckIntervalRef.current) {
             clearInterval(recordingCheckIntervalRef.current);
             recordingCheckIntervalRef.current = null;
           }
-        } 
+        }
         else if (data.status === 'enqueued' || data.status === 'processing') {
-          setStatus(`Recording is ${data.status}. Still processing...`);
+          setStatus(`Recording is ${data.status}. Processing may take several minutes...`);
         }
         else if (data.status === 'failed') {
           setIsRecording(false);
@@ -197,6 +209,11 @@ const VideoCallPage = ({ identityPrefix }) => {
             recordingCheckIntervalRef.current = null;
           }
         }
+        else {
+          setStatus(`Recording status: ${data.status}`);
+        }
+      } else {
+        console.error('Failed to fetch recording status:', res.status, res.statusText);
       }
     } catch (err) {
       console.error('Error checking recording status:', err);
@@ -427,10 +444,10 @@ const VideoCallPage = ({ identityPrefix }) => {
   // --- Recording handlers ---
   const startRecording = async () => {
     if(isRecordingBusy) return;
-    setIsRecordingBusy(true); 
+    setIsRecordingBusy(true);
     setStatus(null);
     setRecordingStatus('');
-    
+
     try {
       if(!resolvedRoomName || !roomSid) {
         throw new Error('Room information not available. Please wait for connection to complete.');
@@ -440,65 +457,73 @@ const VideoCallPage = ({ identityPrefix }) => {
         RoomSid: roomSid,
         RoomName: resolvedRoomName
       };
-        
-      const res = await fetch(`${normalizedBackendUrl}/api/video/start-recording`, { 
-        method:'POST', 
-        headers:{'Content-Type':'application/json'}, 
-        body:JSON.stringify(requestBody) 
+
+      console.log('Starting recording with:', requestBody);
+      const res = await fetch(`${normalizedBackendUrl}/api/video/start-recording`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(requestBody)
       });
-      
+
       if(!res.ok) {
         let errorDetails = '';
         try {
           const errorData = await res.json();
-          errorDetails = errorData.details || errorData.error || await res.text();
+          errorDetails = errorData.details || errorData.error || JSON.stringify(errorData);
         } catch {
           errorDetails = await res.text();
         }
-        
+
         throw new Error(`Start failed: ${res.status} ${errorDetails}`);
       }
-      
+
       const data = await res.json();
-      
-      // Set the appropriate SID based on recording type
-      if (data.type === 'recording') {
-        setRecordingSid(data.recordingSid);
-        setRecordingType('recording');
-      } else {
+      console.log('Start recording response:', data);
+
+      // Handle the response - now we primarily use compositions
+      if (data.type === 'composition' && data.compositionSid) {
         setCompositionSid(data.compositionSid);
         setRecordingType('composition');
+        setRecordingStatus(data.status || 'enqueued');
+      } else if (data.type === 'recording' && data.recordingSid) {
+        setRecordingSid(data.recordingSid);
+        setRecordingType('recording');
+        setRecordingStatus(data.status || 'enqueued');
+      } else {
+        throw new Error('Invalid response from server');
       }
-      
-      setIsRecording(true); 
-      setDownloadUrl(null); 
-      setStatus('Recording started...');
-      setRecordingStatus('enqueued');
-      
+
+      setIsRecording(true);
+      setDownloadUrl(null);
+      setStatus('Recording started. Processing...');
+
+      // Clear any existing interval
       if (recordingCheckIntervalRef.current) {
         clearInterval(recordingCheckIntervalRef.current);
       }
-      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 3000);
-      
-      toast.success('Recording started.');
-    } catch(err){ 
-      console.error('Start recording error:', err); 
-      setStatus(err.message); 
-      toast.error(err.message); 
-    } finally{ 
-      setIsRecordingBusy(false); 
+
+      // Start checking status every 5 seconds
+      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 5000);
+
+      toast.success('Recording started successfully!');
+    } catch(err){
+      console.error('Start recording error:', err);
+      setStatus(err.message);
+      toast.error(err.message);
+    } finally{
+      setIsRecordingBusy(false);
     }
   };
 
   const stopRecording = async () => {
     if (!compositionSid && !recordingSid && (!roomSid || !resolvedRoomName)) {
-      toast.error('Insufficient recording information to stop recording.');
+      toast.error('No active recording to stop.');
       return;
     }
 
     setIsRecordingBusy(true);
-    setStatus('Stopping recording...');
-    
+    setStatus('Checking recording status...');
+
     try {
       const requestBody = {
         RecordingSid: recordingSid || "",
@@ -507,12 +532,13 @@ const VideoCallPage = ({ identityPrefix }) => {
         RoomName: resolvedRoomName || ""
       };
 
+      console.log('Stopping recording with:', requestBody);
       const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
       });
-      
+
       if (!res.ok) {
         let errorDetails = '';
         try {
@@ -521,97 +547,99 @@ const VideoCallPage = ({ identityPrefix }) => {
         } catch {
           errorDetails = await res.text();
         }
-        
+
         throw new Error(`Stop failed: ${res.status} ${errorDetails}`);
       }
-      
+
       const data = await res.json();
-      
-      // Update state based on response type
-      if (data.type === 'recording') {
-        setRecordingSid(data.recordingSid || data.sid);
-        setRecordingType('recording');
-      } else if (data.type === 'composition') {
+      console.log('Stop recording response:', data);
+
+      // Update state based on response
+      if (data.type === 'composition' && (data.compositionSid || data.sid)) {
         setCompositionSid(data.compositionSid || data.sid);
         setRecordingType('composition');
+      } else if (data.type === 'recording' && (data.recordingSid || data.sid)) {
+        setRecordingSid(data.recordingSid || data.sid);
+        setRecordingType('recording');
       }
-      
+
+      setRecordingStatus(data.status);
+
       // Handle different statuses
       if (data.status === 'completed') {
-        // For recordings, we need to use the backend download endpoint
-        const downloadEndpoint = `${normalizedBackendUrl}/api/video/download-recording`;
-        setDownloadUrl(downloadEndpoint);
+        setDownloadUrl(data.downloadUrl || `${normalizedBackendUrl}/api/video/download-recording`);
         setIsRecording(false);
-        setStatus(`Recording complete (${data.duration}s). Ready for download.`);
-        setRecordingStatus('completed');
-        toast.success('Recording ready for download.');
-        
+        setStatus(`Recording complete (${data.duration || 0}s). Ready for download.`);
+        toast.success('Recording ready for download!');
+
         if (recordingCheckIntervalRef.current) {
           clearInterval(recordingCheckIntervalRef.current);
           recordingCheckIntervalRef.current = null;
         }
-      } 
+      }
       else if (data.status === 'enqueued' || data.status === 'processing') {
-        setRecordingStatus(data.status);
-        setStatus(`Recording is ${data.status}. This may take several minutes...`);
-        
+        setStatus(`Recording is ${data.status}. Processing may take several minutes...`);
+
         if (recordingCheckIntervalRef.current) {
           clearInterval(recordingCheckIntervalRef.current);
         }
-        
+
+        // Check status every 10 seconds for processing recordings
         recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 10000);
-        
-        toast.success(`Recording is being processed. This may take several minutes.`);
+
+        toast.success(`Recording is being processed. Please wait...`);
       }
       else if (data.status === 'failed') {
         setIsRecording(false);
-        setStatus('Recording failed. Please try again.');
-        setRecordingStatus('failed');
+        setStatus('Recording failed.');
         toast.error('Recording failed. Please try starting a new recording.');
-        
+
         if (recordingCheckIntervalRef.current) {
           clearInterval(recordingCheckIntervalRef.current);
           recordingCheckIntervalRef.current = null;
         }
       }
       else {
-        setRecordingStatus(data.status);
         setStatus(`Recording status: ${data.status}`);
-        
+
         if (recordingCheckIntervalRef.current) {
           clearInterval(recordingCheckIntervalRef.current);
         }
-        
-        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 5000);
-        
-        toast.success(`Recording status: ${data.status}`);
+
+        // Continue checking for other statuses
+        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 8000);
+
+        toast.info(`Recording status: ${data.status}`);
       }
     } catch(err) {
-      console.error('Error in stopRecording:', err); 
-      setStatus('Error while stopping recording.'); 
-      toast.error(err.message); 
-    } finally { 
-      setIsRecordingBusy(false); 
+      console.error('Error in stopRecording:', err);
+      setStatus('Error while checking recording status.');
+      toast.error(err.message);
+    } finally {
+      setIsRecordingBusy(false);
     }
   };
 
   const downloadRecording = async () => {
-    if (!downloadUrl) return;
-    
+    if (!downloadUrl && !recordingSid && !compositionSid) {
+      toast.error('No recording available for download');
+      return;
+    }
+
     try {
       setStatus('Preparing download...');
-      
-      if (recordingType === 'recording' && recordingSid) {
-        // For recordings, use the backend download endpoint with recording SID
+
+      // Use the appropriate SID for download
+      const sidToUse = compositionSid || recordingSid;
+
+      if (sidToUse) {
+        console.log(`Downloading ${recordingType} with SID: ${sidToUse}`);
         await triggerDownloadViaFetch(
-          `${normalizedBackendUrl}/api/video/download-recording`,
-          `recording_${recordingSid}.mp4`
+          downloadUrl || `${normalizedBackendUrl}/api/video/download-recording`,
+          `${recordingType}_${sidToUse}.mp4`
         );
-      } else if (downloadUrl) {
-        // For compositions, use the direct media URL
-        await triggerDownloadViaFetch(downloadUrl, `recording_${compositionSid}.mp4`);
       } else {
-        throw new Error('No download available');
+        throw new Error('No recording SID available for download');
       }
     } catch (err) {
       console.error('Download error:', err);
@@ -624,23 +652,6 @@ const VideoCallPage = ({ identityPrefix }) => {
     if (!recordingSid && !compositionSid) return;
     await checkRecordingStatus();
     toast.success('Recording status refreshed');
-  };
-
-  const cleanupStuckRecordings = async () => {
-    try {
-      const res = await fetch(`${normalizedBackendUrl}/api/video/cleanup-recordings`, {
-        method: 'DELETE'
-      });
-      
-      if (res.ok) {
-        toast.success('Cleaned up stuck recordings');
-      } else {
-        toast.error('Cleanup failed');
-      }
-    } catch (err) {
-      console.error('Cleanup error:', err);
-      toast.error('Cleanup failed');
-    }
   };
 
   // --- Render ---
@@ -713,13 +724,13 @@ const VideoCallPage = ({ identityPrefix }) => {
           )}
 
           <div className="flex space-x-2">
-            <input 
-              type="text" 
-              value={smsInput} 
-              onChange={(e) => setSmsInput(e.target.value)} 
-              placeholder="Type a message..." 
+            <input
+              type="text"
+              value={smsInput}
+              onChange={(e) => setSmsInput(e.target.value)}
+              placeholder="Type a message..."
               className="flex-1 p-2 rounded bg-gray-700 text-white"
-              onKeyPress={(e) => e.key === 'Enter' && sendChat()}
+              onKeyDown={(e) => e.key === 'Enter' && sendChat()}
             />
             <button 
               onClick={sendChat} 
