@@ -397,12 +397,18 @@ const VideoCallPage = ({ identityPrefix }) => {
   };
 
   const stopRecording = async () => {
-    if(!compositionSid && !roomSid) {
+    console.log('stopRecording called with:', {
+      compositionSid,
+      roomSid,
+      resolvedRoomName
+    });
+
+    if(!compositionSid && !roomSid && !resolvedRoomName) {
       toast.error('No active recording or room information.');
       return;
     }
-    
-    setIsRecordingBusy(true); 
+
+    setIsRecordingBusy(true);
     setStatus('Stopping recording...');
     try {
       // Use CompositionSid if available (preferred method)
@@ -424,17 +430,19 @@ const VideoCallPage = ({ identityPrefix }) => {
         handleStopResponse(data);
       } 
       // Fallback to room-based approach if CompositionSid is not available
-      else if (roomSid || resolvedRoomName) {
-        // FIX: Send both RoomSid and RoomName to satisfy backend validation
-        const requestBody = { 
+      else if (roomSid && resolvedRoomName) {
+        // Send both RoomSid and RoomName (both are required by backend)
+        const requestBody = {
           RoomSid: roomSid,
           RoomName: resolvedRoomName
         };
-        
-        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, { 
-          method:'POST', 
-          headers:{'Content-Type':'application/json'}, 
-          body:JSON.stringify(requestBody) 
+
+        console.log('Sending stop recording request with:', requestBody);
+
+        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(requestBody)
         });
         
         if(!res.ok) {
@@ -444,8 +452,14 @@ const VideoCallPage = ({ identityPrefix }) => {
         
         const data = await res.json();
         handleStopResponse(data);
+      } else {
+        // If we don't have both required fields, show a specific error
+        const missingFields = [];
+        if (!roomSid) missingFields.push('RoomSid');
+        if (!resolvedRoomName) missingFields.push('RoomName');
+        throw new Error(`Cannot stop recording: Missing required fields: ${missingFields.join(', ')}`);
       }
-    } catch(err){ 
+    } catch(err){
       console.error(err); 
       setStatus('Error while stopping recording.'); 
       toast.error(err.message); 
