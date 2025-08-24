@@ -359,11 +359,13 @@ const VideoCallPage = ({ identityPrefix }) => {
     setIsRecordingBusy(true); 
     setStatus(null);
     try {
-      if(!resolvedRoomName && !roomSid) throw new Error('Room information not available.');
-      
-      const requestBody = roomSid 
-        ? { RoomSid: roomSid, RoomName: resolvedRoomName }
-        : { RoomName: resolvedRoomName };
+      if(!resolvedRoomName || !roomSid) throw new Error('Room information not available. Both RoomSid and RoomName are required.');
+
+      // Always include both RoomSid and RoomName as backend requires both
+      const requestBody = {
+        RoomSid: roomSid,
+        RoomName: resolvedRoomName
+      };
         
       const res = await fetch(`${normalizedBackendUrl}/api/video/start-recording`, { 
         method:'POST', 
@@ -403,9 +405,15 @@ const VideoCallPage = ({ identityPrefix }) => {
       resolvedRoomName
     });
 
-    if(!compositionSid && !roomSid && !resolvedRoomName) {
-      toast.error('No active recording or room information.');
+    // Check if we have enough information to stop recording
+    if (!compositionSid && (!roomSid || !resolvedRoomName)) {
+      toast.error('Insufficient recording information to stop recording.');
       return;
+    }
+
+    // If using CompositionSid but missing room info, warn but continue
+    if (compositionSid && (!roomSid || !resolvedRoomName)) {
+      console.warn('CompositionSid available but missing room info. Backend may require all fields.');
     }
 
     setIsRecordingBusy(true);
@@ -413,12 +421,19 @@ const VideoCallPage = ({ identityPrefix }) => {
     try {
       // Use CompositionSid if available (preferred method)
       if (compositionSid) {
-        const requestBody = { CompositionSid: compositionSid };
-        
-        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, { 
-          method:'POST', 
-          headers:{'Content-Type':'application/json'}, 
-          body:JSON.stringify(requestBody) 
+        // Backend requires all fields even when using CompositionSid
+        const requestBody = {
+          CompositionSid: compositionSid,
+          RoomSid: roomSid || '',
+          RoomName: resolvedRoomName || ''
+        };
+
+        console.log('Sending stop recording request with CompositionSid:', requestBody);
+
+        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(requestBody)
         });
         
         if(!res.ok) {
@@ -437,7 +452,7 @@ const VideoCallPage = ({ identityPrefix }) => {
           RoomName: resolvedRoomName
         };
 
-        console.log('Sending stop recording request with:', requestBody);
+        console.log('Sending stop recording request with room info:', requestBody);
 
         const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
           method:'POST',
@@ -460,7 +475,7 @@ const VideoCallPage = ({ identityPrefix }) => {
         throw new Error(`Cannot stop recording: Missing required fields: ${missingFields.join(', ')}`);
       }
     } catch(err){
-      console.error(err); 
+      console.error('Error in stopRecording:', err); 
       setStatus('Error while stopping recording.'); 
       toast.error(err.message); 
     } finally{ 
