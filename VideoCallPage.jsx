@@ -1,6 +1,7 @@
+// VideoCallPage.jsx
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, ArrowDown } from 'lucide-react';
+import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, Download } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as signalR from '@microsoft/signalr';
 import { WEBHOOK_CONFIG } from '../config/webhooks';
@@ -18,8 +19,10 @@ const VideoCallPage = ({ identityPrefix }) => {
   const roomRef = useRef(null);
   const hasJoinedRef = useRef(false);
   const chatScrollRef = useRef(null);
+  const recordingCheckIntervalRef = useRef(null);
 
   const [resolvedRoomName, setResolvedRoomName] = useState(urlRoomName);
+  const [roomSid, setRoomSid] = useState(null);
   const [participants, setParticipants] = useState([]);
   const [isConnecting, setIsConnecting] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -35,6 +38,13 @@ const VideoCallPage = ({ identityPrefix }) => {
 
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
 
+  // Recording state
+  const [compositionSid, setCompositionSid] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState(null);
+  const [isRecordingBusy, setIsRecordingBusy] = useState(false);
+  const [status, setStatus] = useState(null);
+
   const isPatient = identityPrefix === 'patient';
   const themeColor = isPatient ? 'blue' : 'green';
 
@@ -42,39 +52,75 @@ const VideoCallPage = ({ identityPrefix }) => {
     (WEBHOOK_CONFIG && WEBHOOK_CONFIG.BACKEND_BASE_URL) ||
     process.env.REACT_APP_BACKEND_URL ||
     'https://localhost:5001';
+  const normalizedBackendUrl = backendBaseUrl.replace(/\/+$/, '');
 
-  // --- cleanup ---
-  const cleanupConnections = async () => {
-    try {
-      if (roomRef.current) {
-        roomRef.current.disconnect();
-        roomRef.current = null;
-      }
-    } catch {}
-    try {
-      if (hubConnectionRef.current) {
-        await hubConnectionRef.current.stop();
-        hubConnectionRef.current = null;
-      }
-    } catch {}
-    hasJoinedRef.current = false;
-    setIsConnected(false);
-  };
-
+  // --- attach / detach helpers ---
   const attachTrack = (track, container) => {
     if (!track || !container) return;
-    if (container.querySelector(`[data-track-id="${track.sid}"]`)) return;
     const el = track.attach();
-    el.dataset.trackId = track.sid;
-    el.style.width = '100%';
-    el.style.height = '100%';
-    el.style.objectFit = 'cover';
     container.appendChild(el);
   };
 
   const detachTrack = (track) => {
     if (!track) return;
-    track.detach().forEach((el) => el.remove());
+    (track.detach ? track.detach() : []).forEach((el) => el.remove());
+  };
+
+  // --- cleanup ---
+  const cleanupConnections = async () => {
+    try { roomRef.current?.disconnect(); roomRef.current = null; } catch {}
+    try { await hubConnectionRef.current?.stop(); hubConnectionRef.current = null; } catch {}
+    if (recordingCheckIntervalRef.current) {
+      clearInterval(recordingCheckIntervalRef.current);
+      recordingCheckIntervalRef.current = null;
+    }
+    hasJoinedRef.current = false;
+    setIsConnected(false);
+  };
+
+  // --- trigger download helper ---
+  const triggerDownloadViaFetch = async (url, suggestedFilename) => {
+    try {
+      setStatus('Downloading recording...');
+      
+      // Use backend proxy for download to handle authentication
+      const downloadResp = await fetch(`${normalizedBackendUrl}/api/video/download-recording`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mediaUrl: url })
+      });
+      
+      if (!downloadResp.ok) throw new Error(`Download failed: ${downloadResp.status}`);
+      
+      const blob = await downloadResp.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = suggestedFilename || `recording_${compositionSid || Date.now()}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(blobUrl);
+      setStatus('Download started');
+      toast.success('Download started.');
+    } catch (err) {
+      console.error('triggerDownload error:', err);
+      setStatus('Download failed.');
+      toast.error(err.message || 'Download failed.');
+    }
+  };
+
+  // --- leave call handler ---
+  const leaveCall = async () => {
+    try {
+      await cleanupConnections();
+      navigate('/thank-you');
+    } catch (err) {
+      console.error('Error leaving call:', err);
+      toast.error('Error leaving call');
+      try { await cleanupConnections(); } catch {}
+      navigate('/');
+    }
   };
 
   const handlePublication = (participantSid, publication) => {
@@ -91,15 +137,10 @@ const VideoCallPage = ({ identityPrefix }) => {
 
   const handleParticipantConnected = (participant) => {
     if (participant.identity === roomRef.current?.localParticipant.identity) return;
-    setParticipants((prev) => {
-      const exists = prev.some((p) => p.sid === participant.sid);
-      return exists ? prev : [...prev, participant];
-    });
-    participant.tracks.forEach((publication) => handlePublication(participant.sid, publication));
-    participant.on('trackPublished', (publication) => handlePublication(participant.sid, publication));
-    participant.on('trackUnpublished', (publication) => {
-      if (publication.track) detachTrack(publication.track);
-    });
+    setParticipants((prev) => prev.some((p) => p.sid === participant.sid) ? prev : [...prev, participant]);
+    participant.tracks.forEach((pub) => handlePublication(participant.sid, pub));
+    participant.on('trackPublished', (pub) => handlePublication(participant.sid, pub));
+    participant.on('trackUnpublished', (pub) => pub.track && detachTrack(pub.track));
   };
 
   const handleParticipantDisconnected = (participant) => {
@@ -107,22 +148,51 @@ const VideoCallPage = ({ identityPrefix }) => {
     participant.tracks.forEach((pub) => pub.track && detachTrack(pub.track));
   };
 
+  // Check recording status periodically
+  const checkRecordingStatus = async (sid) => {
+    try {
+      const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status === 'completed' && data.downloadUrl) {
+          setDownloadUrl(data.downloadUrl);
+          setIsRecording(false);
+          setStatus('Recording complete. Ready for download.');
+          toast.success('Recording ready for download.');
+          if (recordingCheckIntervalRef.current) {
+            clearInterval(recordingCheckIntervalRef.current);
+            recordingCheckIntervalRef.current = null;
+          }
+        } else if (data.status === 'failed') {
+          setIsRecording(false);
+          setStatus('Recording failed.');
+          toast.error('Recording failed.');
+          if (recordingCheckIntervalRef.current) {
+            clearInterval(recordingCheckIntervalRef.current);
+            recordingCheckIntervalRef.current = null;
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error checking recording status:', err);
+    }
+  };
+
+  // --- join room ---
   useEffect(() => {
     const joinRoom = async () => {
       if (hasJoinedRef.current) return;
       hasJoinedRef.current = true;
-
       try {
         await cleanupConnections();
         setIsConnecting(true);
         setConnectionStatus('Connecting...');
-
         const queryParams = new URLSearchParams(location.search);
         const idFromUrl = queryParams.get('identity');
         const id = idFromUrl || `${identityPrefix}_${Math.floor(Math.random() * 10000)}`;
         setIdentity(id);
 
-        const tokenResp = await fetch(WEBHOOK_CONFIG.VIDEO_TOKEN_API, {
+        const tokenResp = await fetch(`${normalizedBackendUrl}/api/video/token`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ identity: id, roomName: urlRoomName, userType: identityPrefix }),
@@ -133,73 +203,75 @@ const VideoCallPage = ({ identityPrefix }) => {
         const VideoLib = await import('twilio-video');
         VideoLibRef.current = VideoLib;
 
+        // Try to get user media, but don't fail if not available
         const tracks = [];
-        if (isVideoEnabled) {
-          try {
-            const vTrack = await VideoLib.createLocalVideoTrack();
-            tracks.push(vTrack);
-          } catch {
-            setIsVideoEnabled(false);
+        try {
+          if (isVideoEnabled) {
+            const videoTrack = await VideoLib.createLocalVideoTrack().catch(() => {
+              setIsVideoEnabled(false);
+              toast.error('Camera not available');
+              return null;
+            });
+            if (videoTrack) tracks.push(videoTrack);
           }
-        }
-        if (isAudioEnabled) {
-          try {
-            const aTrack = await VideoLib.createLocalAudioTrack();
-            tracks.push(aTrack);
-          } catch {
-            setIsAudioEnabled(false);
-            toast('No microphone detected, continuing without audio.');
-          }
+        } catch (e) {
+          setIsVideoEnabled(false);
+          console.warn('Video not available:', e);
         }
 
-        const connectedRoom = await VideoLib.connect(token, { name: serverRoomName || urlRoomName, tracks });
+        try {
+          if (isAudioEnabled) {
+            const audioTrack = await VideoLib.createLocalAudioTrack().catch(() => {
+              setIsAudioEnabled(false);
+              toast.error('Microphone not available');
+              return null;
+            });
+            if (audioTrack) tracks.push(audioTrack);
+          }
+        } catch (e) {
+          setIsAudioEnabled(false);
+          console.warn('Audio not available:', e);
+        }
+
+        const connectedRoom = await VideoLib.connect(token, { 
+          name: serverRoomName || urlRoomName, 
+          tracks,
+          dominantSpeaker: true,
+          networkQuality: true,
+          preferredVideoCodecs: [{ codec: 'VP8', simulcast: true }]
+        });
+        
         roomRef.current = connectedRoom;
         setResolvedRoomName(serverRoomName || urlRoomName);
         setIsConnected(true);
         setIsConnecting(false);
         setConnectionStatus('Connected');
 
-        connectedRoom.localParticipant.videoTracks.forEach((pub) => {
-          if (pub.track && localVideoRef.current) {
-            const el = pub.track.attach();
-            localVideoRef.current.appendChild(el);
-          }
-        });
+        // Get the room SID for recording
+        setRoomSid(connectedRoom.sid);
 
-        connectedRoom.participants.forEach((p) => handleParticipantConnected(p));
+        connectedRoom.localParticipant.videoTracks.forEach((pub) => { 
+          if(pub.track) attachTrack(pub.track, localVideoRef.current); 
+        });
+        
+        connectedRoom.participants.forEach(handleParticipantConnected);
         connectedRoom.on('participantConnected', handleParticipantConnected);
         connectedRoom.on('participantDisconnected', handleParticipantDisconnected);
-
         connectedRoom.on('disconnected', (disconnectedRoom) => {
           setIsConnected(false);
           setConnectionStatus('Disconnected');
-          disconnectedRoom.localParticipant.tracks.forEach((pub) => {
-            if (pub.track) {
-              detachTrack(pub.track);
-              pub.track.stop();
-            }
-          });
+          disconnectedRoom.localParticipant.tracks.forEach((pub) => pub.track && detachTrack(pub.track));
         });
 
-        const normalizedApi = backendBaseUrl.replace(/\/+$/, '');
         if (!hubConnectionRef.current) {
           const hubConnection = new signalR.HubConnectionBuilder()
-            .withUrl(`${normalizedApi}/chathub?roomName=${encodeURIComponent(serverRoomName || urlRoomName)}&identity=${encodeURIComponent(id)}`)
+            .withUrl(`${normalizedBackendUrl}/chathub?roomName=${encodeURIComponent(serverRoomName || urlRoomName)}&identity=${encodeURIComponent(id)}`)
             .withAutomaticReconnect()
             .build();
-
           hubConnection.on('ReceiveMessage', (user, message) => {
-            setChatMessages((prev) => [
-              ...prev,
-              { from: user, text: message, self: user === id, timestamp: new Date().toISOString() },
-            ]);
+            setChatMessages((prev) => [...prev, { from: user, text: message, self: user === id, timestamp: new Date().toISOString() }]);
           });
-
-          hubConnection.on('ForceDisconnect', async () => {
-            toast.error('Another session is using your identity.', { duration: 4000 });
-            await cleanupConnections();
-          });
-
+          hubConnection.on('ForceDisconnect', async () => { toast.error('Another session is using your identity.'); await cleanupConnections(); });
           await hubConnection.start();
           hubConnectionRef.current = hubConnection;
         }
@@ -211,171 +283,252 @@ const VideoCallPage = ({ identityPrefix }) => {
         console.error('Join room error:', err);
       }
     };
-
     if (urlRoomName) joinRoom();
     return () => cleanupConnections();
-  }, [urlRoomName, identityPrefix, location.search, backendBaseUrl]);
+  }, [urlRoomName, identityPrefix, location.search, normalizedBackendUrl]);
 
-  // --- chat scroll handling ---
-  const scrollToBottom = () => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; };
-
-  useEffect(() => {
-    if (!chatScrollRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current;
-    const isNearBottom = scrollHeight - scrollTop <= clientHeight + 50;
-    if (isNearBottom) scrollToBottom();
-    else setShowScrollToLatest(true);
-  }, [chatMessages]);
-
-  const handleScroll = () => {
-    if (!chatScrollRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current;
-    setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50));
-  };
-
-  // --- controls ---
+  // --- chat helpers ---
+  const scrollToBottom = () => { if(chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; };
+  useEffect(() => { if(!chatScrollRef.current) return; const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50)); }, [chatMessages]);
+  const handleScroll = () => { if(!chatScrollRef.current) return; const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50)); };
+  
   const toggleVideo = async () => {
-    if (!roomRef.current || !VideoLibRef.current) return;
-    if (isVideoEnabled) {
-      roomRef.current.localParticipant.videoTracks.forEach((pub) => {
-        detachTrack(pub.track);
-        pub.track.stop();
+    if(!roomRef.current || !VideoLibRef.current) return;
+    if(isVideoEnabled){
+      roomRef.current.localParticipant.videoTracks.forEach(pub=>{
+        detachTrack(pub.track); 
+        pub.track.stop?.(); 
         roomRef.current.localParticipant.unpublishTrack(pub.track);
       });
       setIsVideoEnabled(false);
-    } else {
-      try {
-        const track = await VideoLibRef.current.createLocalVideoTrack();
-        roomRef.current.localParticipant.publishTrack(track);
-        attachTrack(track, localVideoRef.current);
-        attachTrack(track, blurredBgRef.current);
-        setIsVideoEnabled(true);
-      } catch { toast.error('Unable to start video.'); }
-    }
+    } else { 
+      try { 
+        const track = await VideoLibRef.current.createLocalVideoTrack().catch(() => {
+          toast.error('Camera not available');
+          return null;
+        });
+        if (track) {
+          roomRef.current.localParticipant.publishTrack(track); 
+          attachTrack(track, localVideoRef.current); 
+          setIsVideoEnabled(true);
+        }
+      } catch { 
+        toast.error('Unable to start video.'); 
+      } 
+    } 
   };
-
+  
   const toggleAudio = async () => {
-    if (!roomRef.current || !VideoLibRef.current) return;
-    if (isAudioEnabled) {
-      roomRef.current.localParticipant.audioTracks.forEach((pub) => {
-        pub.track.stop();
+    if(!roomRef.current || !VideoLibRef.current) return;
+    if(isAudioEnabled){
+      roomRef.current.localParticipant.audioTracks.forEach(pub=>{
+        pub.track.stop?.(); 
         roomRef.current.localParticipant.unpublishTrack(pub.track);
       });
       setIsAudioEnabled(false);
-    } else {
-      try {
-        const track = await VideoLibRef.current.createLocalAudioTrack();
-        roomRef.current.localParticipant.publishTrack(track);
-        setIsAudioEnabled(true);
-      } catch { toast.error('No microphone available.'); }
+    } else { 
+      try { 
+        const track = await VideoLibRef.current.createLocalAudioTrack().catch(() => {
+          toast.error('Microphone not available');
+          return null;
+        });
+        if (track) {
+          roomRef.current.localParticipant.publishTrack(track); 
+          setIsAudioEnabled(true);
+        }
+      } catch { 
+        toast.error('No microphone available.'); 
+      } 
+    } 
+  };
+  
+  const sendChat = async () => { 
+    if(!smsInput.trim() || !hubConnectionRef.current) return; 
+    const msg = smsInput.trim(); 
+    setSmsInput(''); 
+    try { 
+      await hubConnectionRef.current.invoke('SendMessage', resolvedRoomName, identity, msg); 
+    } catch (err) { 
+      console.error('Chat send failed:', err); 
+    } 
+  };
+
+  // --- Recording handlers ---
+  const startRecording = async () => {
+    if(isRecordingBusy) return;
+    setIsRecordingBusy(true); 
+    setStatus(null);
+    try {
+      if(!resolvedRoomName && !roomSid) throw new Error('Room information not available.');
+      
+      const requestBody = roomSid 
+        ? { RoomSid: roomSid, RoomName: resolvedRoomName }
+        : { RoomName: resolvedRoomName };
+        
+      const res = await fetch(`${normalizedBackendUrl}/api/video/start-recording`, { 
+        method:'POST', 
+        headers:{'Content-Type':'application/json'}, 
+        body:JSON.stringify(requestBody) 
+      });
+      
+      if(!res.ok) throw new Error(`Start failed: ${res.status} ${await res.text()}`);
+      const data = await res.json();
+      const sid = data.compositionSid || data.sid;
+      if(!sid) throw new Error('No compositionSid returned.');
+      setCompositionSid(sid); 
+      setIsRecording(true); 
+      setDownloadUrl(null); 
+      setStatus('Recording started...');
+      
+      // Start checking recording status periodically
+      if (recordingCheckIntervalRef.current) {
+        clearInterval(recordingCheckIntervalRef.current);
+      }
+      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(sid), 5000);
+      
+      toast.success('Recording started.');
+    } catch(err){ 
+      console.error(err); 
+      setStatus(err.message); 
+      toast.error(err.message); 
+    } finally{ 
+      setIsRecordingBusy(false); 
     }
   };
 
-  const endCall = () => {
-    cleanupConnections();
-    navigate('/');
+  const stopRecording = async () => {
+    if(!compositionSid && !roomSid) {
+      toast.error('No active recording or room information.');
+      return;
+    }
+    
+    setIsRecordingBusy(true); 
+    setStatus('Stopping recording...');
+    try {
+      // Use CompositionSid if available (preferred method)
+      if (compositionSid) {
+        const requestBody = { CompositionSid: compositionSid };
+        
+        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, { 
+          method:'POST', 
+          headers:{'Content-Type':'application/json'}, 
+          body:JSON.stringify(requestBody) 
+        });
+        
+        if(!res.ok) {
+          const errorText = await res.text();
+          throw new Error(`Stop failed: ${res.status} ${errorText}`);
+        }
+        
+        const data = await res.json();
+        handleStopResponse(data);
+      } 
+      // Fallback to room-based approach if CompositionSid is not available
+      else if (roomSid || resolvedRoomName) {
+        // FIX: Send both RoomSid and RoomName to satisfy backend validation
+        const requestBody = { 
+          RoomSid: roomSid,
+          RoomName: resolvedRoomName
+        };
+        
+        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, { 
+          method:'POST', 
+          headers:{'Content-Type':'application/json'}, 
+          body:JSON.stringify(requestBody) 
+        });
+        
+        if(!res.ok) {
+          const errorText = await res.text();
+          throw new Error(`Stop failed: ${res.status} ${errorText}`);
+        }
+        
+        const data = await res.json();
+        handleStopResponse(data);
+      }
+    } catch(err){ 
+      console.error(err); 
+      setStatus('Error while stopping recording.'); 
+      toast.error(err.message); 
+    } finally{ 
+      setIsRecordingBusy(false); 
+    }
   };
 
-  const sendChat = async () => {
-    if (!smsInput.trim() || !hubConnectionRef.current) return;
-    const msg = smsInput.trim();
-    setSmsInput('');
-    try { await hubConnectionRef.current.invoke('SendMessage', resolvedRoomName, identity, msg); } catch (err) { console.error('Chat send failed:', err); }
+  const handleStopResponse = (data) => {
+    if (data.status === 'completed' && data.downloadUrl) {
+      setDownloadUrl(data.downloadUrl);
+      setIsRecording(false);
+      setStatus('Recording complete. Ready for download.');
+      toast.success('Recording ready for download.');
+    } else {
+      // If not completed yet, start checking status
+      setStatus(`Recording is ${data.status || 'processing'}...`);
+      if (recordingCheckIntervalRef.current) {
+        clearInterval(recordingCheckIntervalRef.current);
+      }
+      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(data.compositionSid || compositionSid), 5000);
+      toast.info(`Recording is ${data.status || 'processing'}. Download will be available soon.`);
+    }
   };
 
-  const uniqueParticipants = participants.reduce((acc, curr) => { if (!acc.some((p) => p.sid === curr.sid)) acc.push(curr); return acc; }, []);
-
-  const formatDate = (date) => {
-    const today = new Date();
-    const d = new Date(date);
-    if (d.toDateString() === today.toDateString()) return 'Today';
-    const yesterday = new Date(); yesterday.setDate(today.getDate() - 1);
-    if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
-    return d.toLocaleDateString();
+  const downloadRecording = async () => {
+    if (!downloadUrl) return;
+    await triggerDownloadViaFetch(downloadUrl, `recording_${compositionSid}.mp4`);
   };
 
+  // --- Render ---
+  const uniqueParticipants = participants.reduce((acc,curr)=>{ if(!acc.some(p=>p.sid===curr.sid)) acc.push(curr); return acc; },[]);
   return (
     <div className="min-h-screen bg-gray-900 flex flex-col">
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-3">
         {/* Video Area */}
         <div className="lg:col-span-2 relative p-2 grid grid-cols-1 md:grid-cols-2 gap-2">
           <AnimatePresence>
-            {uniqueParticipants.length === 0 && (
-              <motion.div key="waiting" className="flex items-center justify-center bg-gray-800 text-white col-span-full rounded-lg">
-                {isConnecting ? 'Connecting...' : 'Waiting for participants...'}
-              </motion.div>
-            )}
-            {uniqueParticipants.map((p) => (
+            {uniqueParticipants.length===0 && (<motion.div key="waiting" className="flex items-center justify-center bg-gray-800 text-white col-span-full rounded-lg">{isConnecting?'Connecting...':'Waiting for participants...'}</motion.div>)}
+            {uniqueParticipants.map(p=>(
               <motion.div key={`participant-${p.sid}`} id={`participant-${p.sid}`} className="relative bg-black rounded-lg overflow-hidden">
-                <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-xs">{p.identity}</span>
+                <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">{p.identity}</span>
               </motion.div>
             ))}
-          </AnimatePresence>
-
-          {/* Local video */}
-          <motion.div drag dragConstraints={{ left: 0, top: 0, right: 300, bottom: 300 }} className="absolute top-4 right-4 w-40 h-32 rounded-lg overflow-hidden border-2 border-white shadow-lg cursor-move">
-            <div ref={blurredBgRef} className="absolute inset-0 blur-lg scale-110 opacity-50" style={{ pointerEvents: 'none' }} />
-            <div ref={localVideoRef} className="relative w-full h-full flex items-center justify-center">
-              {!isVideoEnabled && (<div className="text-white text-center"><VideoOff size={24}/><p className="text-xs mt-1">Video Off</p></div>)}
+            <div ref={localVideoRef} className="relative bg-black rounded-lg overflow-hidden">
+              <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">You</span>
             </div>
-          </motion.div>
+          </AnimatePresence>
         </div>
 
-        {/* Chat Panel */}
-        <div className="bg-gray-800 flex flex-col border-l border-gray-700 relative">
-          <div className="p-3 border-b border-gray-700 text-white font-bold">Live Chat</div>
-          <div ref={chatScrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-3 space-y-2">
-            {chatMessages.length === 0 && <div className="text-gray-400 text-sm text-center mt-4">No messages yet</div>}
-            {chatMessages.map((msg, idx) => {
-              const msgDate = formatDate(msg.timestamp);
-              const prevDate = idx > 0 ? formatDate(chatMessages[idx - 1].timestamp) : null;
-              const showDateSeparator = msgDate !== prevDate;
-              const isPatientMsg = msg.from.toLowerCase().includes('patient');
-              const bubbleColor = msg.self ? 'bg-blue-500 text-white ml-auto' : isPatientMsg ? 'bg-blue-400 text-white mr-auto' : 'bg-green-400 text-black mr-auto';
-
-              return (
-                <React.Fragment key={idx}>
-                  {showDateSeparator && <div className="text-center text-xs text-gray-400 my-2">{msgDate}</div>}
-                  <div className={`max-w-sm md:max-w-md lg:max-w-lg p-2 rounded-lg break-words ${bubbleColor}`}>
-                    <div className="flex justify-between items-center text-xs opacity-80">
-                      <span className="font-semibold">{msg.self ? 'You' : msg.from}</span>
-                      <span>{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                    </div>
-                    <div>{msg.text}</div>
-                  </div>
-                </React.Fragment>
-              );
-            })}
+        {/* Chat & Controls */}
+        <div className="flex flex-col p-2 space-y-2">
+          <div className="flex-1 overflow-y-auto border rounded p-2" ref={chatScrollRef} onScroll={handleScroll}>
+            {chatMessages.map((msg, idx)=>(
+              <div key={idx} className={`p-1 ${msg.self?'text-right':'text-left'}`}>
+                <div className="inline-block bg-gray-700 text-white px-2 py-1 rounded">{msg.text}</div>
+                <div className="text-xs text-gray-400">{msg.from} • {new Date(msg.timestamp).toLocaleTimeString()}</div>
+              </div>
+            ))}
           </div>
 
-          {showScrollToLatest && (
-            <button onClick={scrollToBottom} className="absolute bottom-20 right-4 p-2 rounded-full bg-gray-700 hover:bg-gray-600 text-white shadow">
-              <ArrowDown size={18}/>
-            </button>
-          )}
+          {showScrollToLatest && <button onClick={scrollToBottom} className="bg-blue-500 text-white p-1 rounded text-sm">Scroll to latest</button>}
 
-          <div className="p-3 border-t border-gray-700 flex space-x-2">
-            <input
-              value={smsInput}
-              onChange={(e) => setSmsInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && sendChat()}
-              placeholder="Type a message..."
-              className="flex-1 rounded px-3 py-2 text-black"
-            />
-            <button onClick={sendChat} className="p-2 bg-blue-500 rounded text-white"><Send size={18}/></button>
+          <div className="flex space-x-2">
+            <input type="text" value={smsInput} onChange={(e)=>setSmsInput(e.target.value)} placeholder="Type a message..." className="flex-1 p-2 rounded"/>
+            <button onClick={sendChat} className="bg-blue-500 p-2 rounded"><Send size={16}/></button>
           </div>
+
+          <div className="flex space-x-2 justify-center flex-wrap">
+            <button onClick={toggleVideo} className={`p-2 rounded ${isVideoEnabled?'bg-green-600':'bg-gray-600'}`}>{isVideoEnabled?<Video size={16}/>:<VideoOff size={16}/>}</button>
+            <button onClick={toggleAudio} className={`p-2 rounded ${isAudioEnabled?'bg-green-600':'bg-gray-600'}`}>{isAudioEnabled?<Mic size={16}/>:<MicOff size={16}/>}</button>
+            <button onClick={leaveCall} className="p-2 rounded bg-red-600"><PhoneOff size={16}/></button>
+            <button onClick={startRecording} disabled={isRecording || isRecordingBusy} className="p-2 rounded bg-yellow-600">Start Recording</button>
+            <button onClick={stopRecording} disabled={!isRecording || isRecordingBusy} className="p-2 rounded bg-orange-600">Stop Recording</button>
+            {downloadUrl && (
+              <button onClick={downloadRecording} className="p-2 rounded bg-green-600">
+                <Download size={16} />
+              </button>
+            )}
+          </div>
+
+          {status && <div className="text-sm text-white text-center">{status}</div>}
         </div>
-      </div>
-
-      {/* Call controls */}
-      <div className="bg-black bg-opacity-50 p-4 flex justify-center space-x-4">
-        <button onClick={toggleAudio} className={`p-4 rounded-full ${isAudioEnabled ? `bg-${themeColor}-500` : 'bg-red-500'}`}>
-          {isAudioEnabled ? <Mic className="text-white"/> : <MicOff className="text-white"/>}
-        </button>
-        <button onClick={toggleVideo} className={`p-4 rounded-full ${isVideoEnabled ? `bg-${themeColor}-500` : 'bg-red-500'}`}>
-          {isVideoEnabled ? <Video className="text-white"/> : <VideoOff className="text-white"/>}
-        </button>
-        <button onClick={endCall} className="p-4 rounded-full bg-red-500"><PhoneOff className="text-white"/></button>
       </div>
     </div>
   );
