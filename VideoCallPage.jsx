@@ -181,11 +181,25 @@ const VideoCallPage = ({ identityPrefix }) => {
       }
 
       console.log(`Checking status for ${recordingType} SID: ${sid}`);
-      const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}?type=${recordingType}`);
+      // Use auto-detection for type
+      const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}?type=auto`);
       if (res.ok) {
         const data = await res.json();
         console.log('Recording status response:', data);
         setRecordingStatus(data.status);
+
+        // Update recording type if it changed (e.g., fallback from composition to recording)
+        if (data.type !== recordingType) {
+          console.log(`Recording type changed from ${recordingType} to ${data.type}`);
+          setRecordingType(data.type);
+          if (data.type === 'recording' && data.sid) {
+            setRecordingSid(data.sid);
+            setCompositionSid(null);
+          } else if (data.type === 'composition' && data.sid) {
+            setCompositionSid(data.sid);
+            setRecordingSid(null);
+          }
+        }
 
         if (data.status === 'completed') {
           setDownloadUrl(data.downloadUrl || `${normalizedBackendUrl}/api/video/download-recording`);
@@ -480,14 +494,22 @@ const VideoCallPage = ({ identityPrefix }) => {
       const data = await res.json();
       console.log('Start recording response:', data);
 
-      // Handle the response - now we primarily use compositions
-      if (data.type === 'composition' && data.compositionSid) {
-        setCompositionSid(data.compositionSid);
-        setRecordingType('composition');
-        setRecordingStatus(data.status || 'enqueued');
-      } else if (data.type === 'recording' && data.recordingSid) {
-        setRecordingSid(data.recordingSid);
+      // Handle the response - support both recording types
+      if (data.type === 'recording') {
+        if (data.recordingSid) {
+          setRecordingSid(data.recordingSid);
+          setCompositionSid(null);
+        } else {
+          // Room recording enabled but no specific SID yet
+          setRecordingSid(data.roomSid);
+          setCompositionSid(null);
+        }
         setRecordingType('recording');
+        setRecordingStatus(data.status || 'processing');
+      } else if (data.type === 'composition' && data.compositionSid) {
+        setCompositionSid(data.compositionSid);
+        setRecordingSid(null);
+        setRecordingType('composition');
         setRecordingStatus(data.status || 'enqueued');
       } else {
         throw new Error('Invalid response from server');
@@ -555,12 +577,14 @@ const VideoCallPage = ({ identityPrefix }) => {
       console.log('Stop recording response:', data);
 
       // Update state based on response
-      if (data.type === 'composition' && (data.compositionSid || data.sid)) {
-        setCompositionSid(data.compositionSid || data.sid);
-        setRecordingType('composition');
-      } else if (data.type === 'recording' && (data.recordingSid || data.sid)) {
+      if (data.type === 'recording' && (data.recordingSid || data.sid)) {
         setRecordingSid(data.recordingSid || data.sid);
+        setCompositionSid(null);
         setRecordingType('recording');
+      } else if (data.type === 'composition' && (data.compositionSid || data.sid)) {
+        setCompositionSid(data.compositionSid || data.sid);
+        setRecordingSid(null);
+        setRecordingType('composition');
       }
 
       setRecordingStatus(data.status);
@@ -584,8 +608,9 @@ const VideoCallPage = ({ identityPrefix }) => {
           clearInterval(recordingCheckIntervalRef.current);
         }
 
-        // Check status every 10 seconds for processing recordings
-        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 10000);
+        // For stuck compositions, check more frequently
+        const checkInterval = (data.type === 'composition' && data.status === 'enqueued') ? 5000 : 10000;
+        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), checkInterval);
 
         toast.success(`Recording is being processed. Please wait...`);
       }

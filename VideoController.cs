@@ -141,7 +141,75 @@ namespace TwilioOpenAppointement.Controllers
 
                 var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
 
-                // Use composition approach for better reliability and control
+                // HYBRID APPROACH: Try room recording first (better for short recordings), then fallback to composition
+
+                // OPTION 1: Enable room recording (recommended for short recordings)
+                try
+                {
+                    var roomUpdateUrl = $"https://video.twilio.com/v1/Rooms/{resolvedRoomSid}";
+                    var roomUpdateContent = new Dictionary<string, string>
+                    {
+                        { "Status", "in-progress" },
+                        { "RecordParticipantsOnConnect", "true" }
+                    };
+
+                    using var roomRequest = new HttpRequestMessage(HttpMethod.Post, roomUpdateUrl);
+                    roomRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+                    roomRequest.Content = new FormUrlEncodedContent(roomUpdateContent);
+
+                    var roomResponse = await _httpClient.SendAsync(roomRequest);
+
+                    if (roomResponse.IsSuccessStatusCode)
+                    {
+                        Console.WriteLine($"Room recording enabled for room {resolvedRoomSid}");
+
+                        // Wait a moment for recording to initialize
+                        await Task.Delay(2000);
+
+                        // Check for existing recordings in this room
+                        var recordingsUrl = $"https://video.twilio.com/v1/Recordings?RoomSid={resolvedRoomSid}&Status=processing&PageSize=1";
+                        using var recordingsRequest = new HttpRequestMessage(HttpMethod.Get, recordingsUrl);
+                        recordingsRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                        var recordingsResp = await _httpClient.SendAsync(recordingsRequest);
+                        if (recordingsResp.IsSuccessStatusCode)
+                        {
+                            var recordingsJson = await recordingsResp.Content.ReadAsStringAsync();
+                            using var recordingsDoc = JsonDocument.Parse(recordingsJson);
+                            var recordingsArray = recordingsDoc.RootElement.GetProperty("recordings").EnumerateArray();
+                            var firstRecording = recordingsArray.FirstOrDefault();
+
+                            if (firstRecording.ValueKind != JsonValueKind.Undefined)
+                            {
+                                var recordingSid = firstRecording.GetProperty("sid").GetString();
+                                return Ok(new
+                                {
+                                    recordingSid = recordingSid,
+                                    roomSid = resolvedRoomSid,
+                                    type = "recording",
+                                    status = "processing",
+                                    message = "Room recording started successfully"
+                                });
+                            }
+                        }
+
+                        // If no recording found yet, return room info
+                        return Ok(new
+                        {
+                            roomSid = resolvedRoomSid,
+                            type = "recording",
+                            status = "processing",
+                            message = "Room recording enabled, waiting for participants"
+                        });
+                    }
+                }
+                catch (Exception roomException)
+                {
+                    Console.WriteLine($"Room recording failed: {roomException.Message}");
+                    // Continue to composition fallback
+                }
+
+                // OPTION 2: Fallback to composition
                 try
                 {
                     var compUrl = "https://video.twilio.com/v1/Compositions";
@@ -173,7 +241,7 @@ namespace TwilioOpenAppointement.Controllers
                             roomSid = resolvedRoomSid,
                             type = "composition",
                             status = status,
-                            message = "Recording started successfully"
+                            message = "Composition recording started successfully"
                         });
                     }
                     else
@@ -188,10 +256,10 @@ namespace TwilioOpenAppointement.Controllers
                 }
                 catch (Exception compException)
                 {
-                    Console.WriteLine($"Composition failed: {compException.Message}");
+                    Console.WriteLine($"Composition also failed: {compException.Message}");
                     return StatusCode(500, new
                     {
-                        error = "Recording failed to start",
+                        error = "Both recording methods failed",
                         details = compException.Message
                     });
                 }
@@ -253,7 +321,50 @@ namespace TwilioOpenAppointement.Controllers
             {
                 var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
 
-                // Priority 1: Use CompositionSid if available
+                // Priority 1: Handle RecordingSid (room recordings)
+                if (!string.IsNullOrWhiteSpace(request.RecordingSid))
+                {
+                    var recordingUrl = $"https://video.twilio.com/v1/Recordings/{request.RecordingSid}";
+
+                    using var requestMessage = new HttpRequestMessage(HttpMethod.Get, recordingUrl);
+                    requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                    var recordingResp = await _httpClient.SendAsync(requestMessage);
+                    if (recordingResp.IsSuccessStatusCode)
+                    {
+                        var recordingJson = await recordingResp.Content.ReadAsStringAsync();
+                        using var recordingDoc = JsonDocument.Parse(recordingJson);
+                        var status = recordingDoc.RootElement.GetProperty("Status").GetString().ToLower();
+                        var duration = recordingDoc.RootElement.TryGetProperty("Duration", out var durElem) ?
+                                      durElem.GetInt32() : 0;
+
+                        if (status == "completed")
+                        {
+                            var mediaUrl = $"https://video.twilio.com/v1/Recordings/{request.RecordingSid}/Media";
+                            return Ok(new
+                            {
+                                recordingSid = request.RecordingSid,
+                                status = "completed",
+                                type = "recording",
+                                duration = duration,
+                                downloadUrl = mediaUrl,
+                                sid = request.RecordingSid,
+                                message = "Recording is ready for download"
+                            });
+                        }
+
+                        return Ok(new
+                        {
+                            recordingSid = request.RecordingSid,
+                            status = status,
+                            type = "recording",
+                            duration = duration,
+                            sid = request.RecordingSid
+                        });
+                    }
+                }
+
+                // Priority 2: Handle CompositionSid
                 if (!string.IsNullOrWhiteSpace(request.CompositionSid))
                 {
                     var compositionUrl = $"https://video.twilio.com/v1/Compositions/{request.CompositionSid}";
@@ -270,14 +381,54 @@ namespace TwilioOpenAppointement.Controllers
                         var duration = compositionDoc.RootElement.TryGetProperty("duration", out var durElem) ?
                                       durElem.GetInt32() : 0;
 
-                        var response = new
+                        // Handle stuck compositions with 0 duration
+                        if (status == "enqueued" && duration == 0)
                         {
-                            compositionSid = request.CompositionSid,
-                            status = status,
-                            type = "composition",
-                            duration = duration,
-                            sid = request.CompositionSid
-                        };
+                            Console.WriteLine($"Composition {request.CompositionSid} is stuck in enqueued with 0 duration. Checking for room recordings...");
+
+                            // Try to find room recordings as fallback
+                            string resolvedRoomSid = request.RoomSid;
+                            if (string.IsNullOrWhiteSpace(resolvedRoomSid) && !string.IsNullOrWhiteSpace(request.RoomName))
+                            {
+                                resolvedRoomSid = await GetRoomSid(request.RoomName);
+                            }
+
+                            if (!string.IsNullOrWhiteSpace(resolvedRoomSid))
+                            {
+                                var recordingsUrl = $"https://video.twilio.com/v1/Recordings?RoomSid={resolvedRoomSid}&Status=completed&PageSize=10";
+                                using var recordingsRequest = new HttpRequestMessage(HttpMethod.Get, recordingsUrl);
+                                recordingsRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                                var recordingsResp = await _httpClient.SendAsync(recordingsRequest);
+                                if (recordingsResp.IsSuccessStatusCode)
+                                {
+                                    var recordingsJson = await recordingsResp.Content.ReadAsStringAsync();
+                                    using var recordingsDoc = JsonDocument.Parse(recordingsJson);
+                                    var recordingsArray = recordingsDoc.RootElement.GetProperty("recordings").EnumerateArray();
+                                    var latestRecording = recordingsArray.OrderByDescending(r =>
+                                        DateTime.Parse(r.GetProperty("date_created").GetString())).FirstOrDefault();
+
+                                    if (latestRecording.ValueKind != JsonValueKind.Undefined)
+                                    {
+                                        var recordingSid = latestRecording.GetProperty("sid").GetString();
+                                        var recordingDuration = latestRecording.TryGetProperty("duration", out var recDurElem) ?
+                                                              recDurElem.GetInt32() : 0;
+
+                                        var mediaUrl = $"https://video.twilio.com/v1/Recordings/{recordingSid}/Media";
+                                        return Ok(new
+                                        {
+                                            recordingSid = recordingSid,
+                                            status = "completed",
+                                            type = "recording",
+                                            duration = recordingDuration,
+                                            downloadUrl = mediaUrl,
+                                            sid = recordingSid,
+                                            message = "Found completed room recording as fallback"
+                                        });
+                                    }
+                                }
+                            }
+                        }
 
                         if (status == "completed")
                         {
@@ -294,7 +445,14 @@ namespace TwilioOpenAppointement.Controllers
                             });
                         }
 
-                        return Ok(response);
+                        return Ok(new
+                        {
+                            compositionSid = request.CompositionSid,
+                            status = status,
+                            type = "composition",
+                            duration = duration,
+                            sid = request.CompositionSid
+                        });
                     }
                     else
                     {
@@ -307,7 +465,7 @@ namespace TwilioOpenAppointement.Controllers
                     }
                 }
 
-                // Priority 2: Fallback to room-based lookup for the most recent composition
+                // Priority 3: Fallback to room-based lookup
                 string resolvedRoomSid = request.RoomSid;
 
                 if (string.IsNullOrWhiteSpace(resolvedRoomSid) && !string.IsNullOrWhiteSpace(request.RoomName))
@@ -319,9 +477,55 @@ namespace TwilioOpenAppointement.Controllers
 
                 if (!string.IsNullOrWhiteSpace(resolvedRoomSid))
                 {
-                    // Check for any compositions for this room (not just completed ones)
-                    var compositionsUrl = $"https://video.twilio.com/v1/Compositions?RoomSid={resolvedRoomSid}&PageSize=10";
+                    // First check for room recordings (more reliable for short recordings)
+                    var recordingsUrl = $"https://video.twilio.com/v1/Recordings?RoomSid={resolvedRoomSid}&PageSize=10";
+                    using var recordingsRequest = new HttpRequestMessage(HttpMethod.Get, recordingsUrl);
+                    recordingsRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
 
+                    var recordingsResp = await _httpClient.SendAsync(recordingsRequest);
+                    if (recordingsResp.IsSuccessStatusCode)
+                    {
+                        var recordingsJson = await recordingsResp.Content.ReadAsStringAsync();
+                        using var recordingsDoc = JsonDocument.Parse(recordingsJson);
+                        var recordingsArray = recordingsDoc.RootElement.GetProperty("recordings").EnumerateArray();
+                        var latestRecording = recordingsArray.OrderByDescending(r =>
+                            DateTime.Parse(r.GetProperty("date_created").GetString())).FirstOrDefault();
+
+                        if (latestRecording.ValueKind != JsonValueKind.Undefined)
+                        {
+                            var recordingSid = latestRecording.GetProperty("sid").GetString();
+                            var status = latestRecording.GetProperty("Status").GetString().ToLower();
+                            var duration = latestRecording.TryGetProperty("Duration", out var durElem) ?
+                                          durElem.GetInt32() : 0;
+
+                            if (status == "completed")
+                            {
+                                var mediaUrl = $"https://video.twilio.com/v1/Recordings/{recordingSid}/Media";
+                                return Ok(new
+                                {
+                                    recordingSid = recordingSid,
+                                    status = "completed",
+                                    type = "recording",
+                                    duration = duration,
+                                    downloadUrl = mediaUrl,
+                                    sid = recordingSid,
+                                    message = "Recording is ready for download"
+                                });
+                            }
+
+                            return Ok(new
+                            {
+                                recordingSid = recordingSid,
+                                status = status,
+                                type = "recording",
+                                duration = duration,
+                                sid = recordingSid
+                            });
+                        }
+                    }
+
+                    // Then check for compositions
+                    var compositionsUrl = $"https://video.twilio.com/v1/Compositions?RoomSid={resolvedRoomSid}&PageSize=10";
                     using var compositionsRequest = new HttpRequestMessage(HttpMethod.Get, compositionsUrl);
                     compositionsRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
 
@@ -332,7 +536,6 @@ namespace TwilioOpenAppointement.Controllers
                         using var compDoc = JsonDocument.Parse(compJson);
                         var compArray = compDoc.RootElement.GetProperty("compositions").EnumerateArray();
 
-                        // Get the most recent composition
                         var mostRecentComp = compArray.OrderByDescending(c =>
                             DateTime.Parse(c.GetProperty("date_created").GetString())).FirstOrDefault();
 
@@ -342,15 +545,6 @@ namespace TwilioOpenAppointement.Controllers
                             var status = mostRecentComp.GetProperty("status").GetString();
                             var duration = mostRecentComp.TryGetProperty("duration", out var durElem) ?
                                           durElem.GetInt32() : 0;
-
-                            var response = new
-                            {
-                                compositionSid = compositionSid,
-                                status = status,
-                                type = "composition",
-                                duration = duration,
-                                sid = compositionSid
-                            };
 
                             if (status == "completed")
                             {
@@ -367,7 +561,14 @@ namespace TwilioOpenAppointement.Controllers
                                 });
                             }
 
-                            return Ok(response);
+                            return Ok(new
+                            {
+                                compositionSid = compositionSid,
+                                status = status,
+                                type = "composition",
+                                duration = duration,
+                                sid = compositionSid
+                            });
                         }
                     }
                 }
@@ -375,7 +576,6 @@ namespace TwilioOpenAppointement.Controllers
                 return Ok(new
                 {
                     status = "processing",
-                    type = "composition",
                     message = "Recording is being processed. Please try again later."
                 });
             }
@@ -387,7 +587,7 @@ namespace TwilioOpenAppointement.Controllers
         }
 
         [HttpGet("recording-status/{sid}")]
-        public async Task<IActionResult> GetRecordingStatus(string sid, [FromQuery] string type = "composition")
+        public async Task<IActionResult> GetRecordingStatus(string sid, [FromQuery] string type = "auto")
         {
             if (string.IsNullOrWhiteSpace(sid))
                 return BadRequest("Sid is required.");
@@ -398,6 +598,12 @@ namespace TwilioOpenAppointement.Controllers
                 var authToken = _config["TwilioSettings:AuthToken"];
                 var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
 
+                // Auto-detect type based on SID prefix if not specified
+                if (type == "auto")
+                {
+                    type = sid.StartsWith("CJ") ? "composition" : "recording";
+                }
+
                 if (type == "recording")
                 {
                     var recordingUrl = $"https://video.twilio.com/v1/Recordings/{sid}";
@@ -407,7 +613,11 @@ namespace TwilioOpenAppointement.Controllers
 
                     var recordingResp = await _httpClient.SendAsync(requestMessage);
                     if (!recordingResp.IsSuccessStatusCode)
+                    {
+                        var errorContent = await recordingResp.Content.ReadAsStringAsync();
+                        Console.WriteLine($"Failed to fetch recording {sid}: {errorContent}");
                         return StatusCode((int)recordingResp.StatusCode, "Failed to fetch recording status.");
+                    }
 
                     var recordingJson = await recordingResp.Content.ReadAsStringAsync();
                     using var recordingDoc = JsonDocument.Parse(recordingJson);
@@ -432,7 +642,7 @@ namespace TwilioOpenAppointement.Controllers
                 }
                 else
                 {
-                    // Handle compositions (default)
+                    // Handle compositions
                     var compositionUrl = $"https://video.twilio.com/v1/Compositions/{sid}";
 
                     using var requestMessage = new HttpRequestMessage(HttpMethod.Get, compositionUrl);
