@@ -1,0 +1,1293 @@
+I understand your frustration with the long processing times for Twilio compositions. The "enqueued" status and 5+ minute wait for a 1-minute recording is unacceptable for a patient-facing application. 
+
+The main issue is that Twilio's composition service can have significant delays during peak times. Let me provide you with a **complete solution** that addresses this:
+
+## Solution: Implement Dual Recording Strategy
+
+I'll implement a solution that:
+1. **Uses Twilio's native recording** (faster but less flexible)
+2. **Falls back to compositions** (for advanced features)
+3. **Provides immediate feedback** to users
+4. **Handles delays gracefully**
+
+Here are the complete updated files:
+
+## Backend: VideoController.cs
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Twilio;
+using Twilio.Jwt.AccessToken;
+using Twilio.Rest.Video.V1;
+using Twilio.Rest.Video.V1.Room;
+
+namespace TwilioOpenAppointement.Controllers
+{
+    public class VideoTokenRequest
+    {
+        public string Identity { get; set; }
+        public string RoomName { get; set; }
+        public string UserType { get; set; }
+    }
+
+    public class StartRecordingRequest
+    {
+        public string RoomSid { get; set; }
+        public string RoomName { get; set; }
+    }
+
+    public class StopRecordingRequest
+    {
+        public string RoomSid { get; set; }
+        public string RoomName { get; set; }
+        public string CompositionSid { get; set; }
+        public string RecordingSid { get; set; }
+    }
+
+    public class DownloadRecordingRequest
+    {
+        public string MediaUrl { get; set; }
+        public string RecordingSid { get; set; }
+    }
+
+    public class RecordingStatusResponse
+    {
+        public string Status { get; set; }
+        public string DownloadUrl { get; set; }
+        public string Type { get; set; } // "composition" or "recording"
+        public string Sid { get; set; }
+    }
+
+    [ApiController]
+    [Route("api/[controller]")]
+    public class VideoController : ControllerBase
+    {
+        private readonly IConfiguration _config;
+        private readonly HttpClient _httpClient;
+
+        public VideoController(IConfiguration config)
+        {
+            _config = config;
+            _httpClient = new HttpClient();
+            _httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+            // Initialize Twilio client
+            var accountSid = _config["TwilioSettings:AccountSID"];
+            var authToken = _config["TwilioSettings:AuthToken"];
+            if (!string.IsNullOrEmpty(accountSid) && !string.IsNullOrEmpty(authToken))
+            {
+                TwilioClient.Init(accountSid, authToken);
+            }
+        }
+
+        [HttpPost("token")]
+        public IActionResult GetVideoToken([FromBody] VideoTokenRequest request)
+        {
+            if (request == null) return BadRequest("Request body is missing.");
+            if (string.IsNullOrWhiteSpace(request.Identity)) return BadRequest("Identity is required.");
+            if (string.IsNullOrWhiteSpace(request.RoomName)) return BadRequest("RoomName is required.");
+
+            var accountSid = _config["TwilioSettings:AccountSID"];
+            var apiKeySid = _config["TwilioSettings:ApiKeySID"];
+            var apiKeySecret = _config["TwilioSettings:ApiKeySecret"];
+            var chatServiceSid = _config["TwilioSettings:ChatServiceSID"];
+
+            if (string.IsNullOrEmpty(accountSid) || string.IsNullOrEmpty(apiKeySid) || string.IsNullOrEmpty(apiKeySecret))
+                return StatusCode(500, "Twilio configuration is missing.");
+
+            var videoGrant = new VideoGrant { Room = request.RoomName };
+            var chatGrant = new ChatGrant { ServiceSid = chatServiceSid };
+
+            var token = new Token(
+                accountSid,
+                apiKeySid,
+                apiKeySecret,
+                request.Identity,
+                grants: new HashSet<IGrant> { videoGrant, chatGrant }
+            );
+
+            return Ok(new { token = token.ToJwt(), roomName = request.RoomName });
+        }
+
+        private async Task<string> GetRoomSid(string roomName)
+        {
+            try
+            {
+                var room = await RoomResource.FetchAsync(pathSid: roomName);
+                return room?.Sid;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        [HttpPost("start-recording")]
+        public async Task<IActionResult> StartRecording([FromBody] StartRecordingRequest request)
+        {
+            if (request == null) return BadRequest("Request body is missing.");
+            if (string.IsNullOrWhiteSpace(request.RoomName) && string.IsNullOrWhiteSpace(request.RoomSid))
+                return BadRequest("RoomName or RoomSid is required.");
+
+            var accountSid = _config["TwilioSettings:AccountSID"];
+            var authToken = _config["TwilioSettings:AuthToken"];
+
+            if (string.IsNullOrEmpty(accountSid) || string.IsNullOrEmpty(authToken))
+                return StatusCode(500, "Twilio configuration is missing.");
+
+            string resolvedRoomSid = request.RoomSid;
+
+            if (string.IsNullOrWhiteSpace(resolvedRoomSid))
+            {
+                resolvedRoomSid = await GetRoomSid(request.RoomName);
+                if (string.IsNullOrWhiteSpace(resolvedRoomSid))
+                    return BadRequest("Could not find room.");
+            }
+
+            try
+            {
+                // OPTION 1: Try to start regular recording first (faster)
+                try
+                {
+                    var recording = await RecordingResource.CreateAsync(
+                        groupingSid: new List<string> { resolvedRoomSid },
+                        statusCallback: new Uri($"{Request.Scheme}://{Request.Host}/api/video/recording-callback")
+                    );
+
+                    return Ok(new { 
+                        recordingSid = recording.Sid,
+                        roomSid = resolvedRoomSid,
+                        type = "recording"
+                    });
+                }
+                catch
+                {
+                    // Fall back to composition if recording fails
+                    var compUrl = "https://video.twilio.com/v1/Compositions";
+                    var compContent = new Dictionary<string, string>
+                    {
+                        { "RoomSid", resolvedRoomSid },
+                        { "AudioSources", "*" },
+                        { "VideoLayout", "{\"grid\":{\"video_sources\":[\"*\"]}}" },
+                        { "Format", "mp4" },
+                        { "StatusCallback", $"{Request.Scheme}://{Request.Host}/api/video/composition-callback" }
+                    };
+
+                    var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
+
+                    using var requestMessage = new HttpRequestMessage(HttpMethod.Post, compUrl);
+                    requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+                    requestMessage.Content = new FormUrlEncodedContent(compContent);
+
+                    var response = await _httpClient.SendAsync(requestMessage);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var err = await response.Content.ReadAsStringAsync();
+                        return StatusCode((int)response.StatusCode, new { error = "Failed to create recording or composition", details = err });
+                    }
+
+                    var respJson = await response.Content.ReadAsStringAsync();
+                    using var compDoc = JsonDocument.Parse(respJson);
+                    var compositionSid = compDoc.RootElement.GetProperty("sid").GetString();
+
+                    return Ok(new { 
+                        compositionSid = compositionSid, 
+                        roomSid = resolvedRoomSid,
+                        type = "composition"
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = "Internal server error", details = ex.Message });
+            }
+        }
+
+        [HttpPost("recording-callback")]
+        public IActionResult RecordingWebhook([FromBody] JsonElement payload)
+        {
+            // Handle Twilio webhook for recording status changes
+            try
+            {
+                var status = payload.GetProperty("Status").GetString();
+                var recordingSid = payload.GetProperty("RecordingSid").GetString();
+                
+                // You can store this information or trigger notifications
+                Console.WriteLine($"Recording {recordingSid} status: {status}");
+                
+                return Ok();
+            }
+            catch
+            {
+                return Ok(); // Always return OK to Twilio
+            }
+        }
+
+        [HttpPost("composition-callback")]
+        public IActionResult CompositionWebhook([FromBody] JsonElement payload)
+        {
+            // Handle Twilio webhook for composition status changes
+            try
+            {
+                var status = payload.GetProperty("Status").GetString();
+                var compositionSid = payload.GetProperty("CompositionSid").GetString();
+                
+                // You can store this information or trigger notifications
+                Console.WriteLine($"Composition {compositionSid} status: {status}");
+                
+                return Ok();
+            }
+            catch
+            {
+                return Ok(); // Always return OK to Twilio
+            }
+        }
+
+        [HttpPost("stop-recording")]
+        public async Task<IActionResult> StopRecording([FromBody] StopRecordingRequest request)
+        {
+            if (request == null) return BadRequest("Request body is missing.");
+
+            // Priority 1: Use RecordingSid if available (faster processing)
+            if (!string.IsNullOrWhiteSpace(request.RecordingSid))
+            {
+                try
+                {
+                    // For recordings, they're automatically stopped when the room ends
+                    // We just need to check the status
+                    var recording = await RecordingResource.FetchAsync(pathSid: request.RecordingSid);
+                    
+                    if (recording.Status == RecordingResource.StatusEnum.Completed)
+                    {
+                        return Ok(new
+                        {
+                            recordingSid = recording.Sid,
+                            status = "completed",
+                            type = "recording",
+                            message = "Recording is ready for download"
+                        });
+                    }
+                    
+                    return Ok(new
+                    {
+                        recordingSid = recording.Sid,
+                        status = recording.Status.ToString(),
+                        type = "recording",
+                        message = $"Recording is {recording.Status}. Please try again later."
+                    });
+                }
+                catch (Exception ex)
+                {
+                    // If recording check fails, fall through to composition check
+                    Console.WriteLine($"Recording check failed: {ex.Message}");
+                }
+            }
+
+            // Priority 2: Use CompositionSid
+            if (!string.IsNullOrWhiteSpace(request.CompositionSid))
+            {
+                try
+                {
+                    var compositionUrl = $"https://video.twilio.com/v1/Compositions/{request.CompositionSid}";
+                    var accountSid = _config["TwilioSettings:AccountSID"];
+                    var authToken = _config["TwilioSettings:AuthToken"];
+                    var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
+
+                    using var requestMessage = new HttpRequestMessage(HttpMethod.Get, compositionUrl);
+                    requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                    var compositionResp = await _httpClient.SendAsync(requestMessage);
+                    if (compositionResp.IsSuccessStatusCode)
+                    {
+                        var compositionJson = await compositionResp.Content.ReadAsStringAsync();
+                        using var compositionDoc = JsonDocument.Parse(compositionJson);
+                        var status = compositionDoc.RootElement.GetProperty("status").GetString();
+
+                        if (status == "completed")
+                        {
+                            return Ok(new
+                            {
+                                compositionSid = request.CompositionSid,
+                                status = "completed",
+                                type = "composition",
+                                message = "Recording is ready for download"
+                            });
+                        }
+
+                        return Ok(new
+                        {
+                            compositionSid = request.CompositionSid,
+                            status = status,
+                            type = "composition",
+                            message = $"Composition is {status}. Please try again later."
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Composition check failed: {ex.Message}");
+                }
+            }
+
+            // Priority 3: Fallback to room-based lookup
+            if (string.IsNullOrWhiteSpace(request.RoomName) && string.IsNullOrWhiteSpace(request.RoomSid))
+                return BadRequest("RecordingSid, CompositionSid, or RoomName/RoomSid is required.");
+
+            try
+            {
+                string resolvedRoomSid = request.RoomSid;
+
+                if (string.IsNullOrWhiteSpace(resolvedRoomSid) && !string.IsNullOrWhiteSpace(request.RoomName))
+                {
+                    resolvedRoomSid = await GetRoomSid(request.RoomName);
+                    if (string.IsNullOrWhiteSpace(resolvedRoomSid))
+                        return BadRequest("Could not find room.");
+                }
+
+                // First, try to find completed recordings
+                try
+                {
+                    var recordings = await RecordingResource.ReadAsync(
+                        groupingSid: new List<string> { resolvedRoomSid },
+                        status: RecordingResource.StatusEnum.Completed,
+                        limit: 1
+                    );
+
+                    var recording = recordings.FirstOrDefault();
+                    if (recording != null)
+                    {
+                        return Ok(new
+                        {
+                            recordingSid = recording.Sid,
+                            status = "completed",
+                            type = "recording",
+                            message = "Recording is ready for download"
+                        });
+                    }
+                }
+                catch
+                {
+                    // Continue to check compositions if no recordings found
+                }
+
+                // Check compositions as fallback
+                var compositionsUrl = $"https://video.twilio.com/v1/Compositions?RoomSid={resolvedRoomSid}&Status=completed&PageSize=1";
+                var accountSid = _config["TwilioSettings:AccountSID"];
+                var authToken = _config["TwilioSettings:AuthToken"];
+                var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
+
+                using var requestMessage = new HttpRequestMessage(HttpMethod.Get, compositionsUrl);
+                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                var compResp = await _httpClient.SendAsync(requestMessage);
+                if (compResp.IsSuccessStatusCode)
+                {
+                    var compJson = await compResp.Content.ReadAsStringAsync();
+                    using var compDoc = JsonDocument.Parse(compJson);
+                    var compArray = compDoc.RootElement.GetProperty("compositions").EnumerateArray();
+                    var firstComp = compArray.FirstOrDefault();
+                    
+                    if (firstComp.ValueKind != JsonValueKind.Undefined)
+                    {
+                        var compositionSid = firstComp.GetProperty("sid").GetString();
+                        return Ok(new
+                        {
+                            compositionSid = compositionSid,
+                            status = "completed",
+                            type = "composition",
+                            message = "Recording is ready for download"
+                        });
+                    }
+                }
+
+                return Ok(new
+                {
+                    status = "processing",
+                    message = "Recording is being processed. Please try again later."
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = "Internal server error", details = ex.Message });
+            }
+        }
+
+        [HttpGet("recording-status/{sid}")]
+        public async Task<IActionResult> GetRecordingStatus(string sid, [FromQuery] string type = "composition")
+        {
+            if (string.IsNullOrWhiteSpace(sid))
+                return BadRequest("Sid is required.");
+
+            try
+            {
+                if (type == "recording")
+                {
+                    var recording = await RecordingResource.FetchAsync(pathSid: sid);
+                    return Ok(new RecordingStatusResponse
+                    {
+                        Status = recording.Status.ToString(),
+                        Type = "recording",
+                        Sid = recording.Sid
+                    });
+                }
+                else
+                {
+                    var accountSid = _config["TwilioSettings:AccountSID"];
+                    var authToken = _config["TwilioSettings:AuthToken"];
+                    var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
+                    var compositionUrl = $"https://video.twilio.com/v1/Compositions/{sid}";
+
+                    using var requestMessage = new HttpRequestMessage(HttpMethod.Get, compositionUrl);
+                    requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                    var compositionResp = await _httpClient.SendAsync(requestMessage);
+                    if (!compositionResp.IsSuccessStatusCode)
+                        return StatusCode((int)compositionResp.StatusCode, "Failed to fetch status.");
+
+                    var compositionJson = await compositionResp.Content.ReadAsStringAsync();
+                    using var compositionDoc = JsonDocument.Parse(compositionJson);
+                    var status = compositionDoc.RootElement.GetProperty("status").GetString();
+
+                    var response = new RecordingStatusResponse
+                    {
+                        Status = status,
+                        Type = "composition",
+                        Sid = sid
+                    };
+
+                    if (status == "completed")
+                    {
+                        response.DownloadUrl = $"https://video.twilio.com/v1/Compositions/{sid}/Media?Ttl=3600";
+                    }
+
+                    return Ok(response);
+                }
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = "Internal server error", details = ex.Message });
+            }
+        }
+
+        [HttpPost("download-recording")]
+        public async Task<IActionResult> DownloadRecording([FromBody] DownloadRecordingRequest request)
+        {
+            if (request == null) return BadRequest("Request body is missing.");
+            
+            var accountSid = _config["TwilioSettings:AccountSID"];
+            var authToken = _config["TwilioSettings:AuthToken"];
+
+            if (string.IsNullOrEmpty(accountSid) || string.IsNullOrEmpty(authToken))
+                return StatusCode(500, "Twilio configuration is missing.");
+
+            try
+            {
+                string mediaUrl;
+                
+                if (!string.IsNullOrEmpty(request.RecordingSid))
+                {
+                    // For recordings, we need to construct the media URL
+                    mediaUrl = $"https://video.twilio.com/v1/Recordings/{request.RecordingSid}/Media";
+                }
+                else if (!string.IsNullOrEmpty(request.MediaUrl))
+                {
+                    mediaUrl = request.MediaUrl;
+                }
+                else
+                {
+                    return BadRequest("MediaUrl or RecordingSid is required.");
+                }
+
+                var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
+
+                using var requestMessage = new HttpRequestMessage(HttpMethod.Get, mediaUrl);
+                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
+
+                var response = await _httpClient.SendAsync(requestMessage);
+                if (!response.IsSuccessStatusCode)
+                {
+                    return StatusCode((int)response.StatusCode, "Failed to download recording.");
+                }
+
+                var content = await response.Content.ReadAsByteArrayAsync();
+                var contentType = response.Content.Headers.ContentType?.ToString() ?? "video/mp4";
+
+                return File(content, contentType, "recording.mp4");
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { error = "Internal server error", details = ex.Message });
+            }
+        }
+    }
+}
+```
+
+## Frontend: VideoCallPage.jsx
+
+```jsx
+// VideoCallPage.jsx
+import React, { useEffect, useRef, useState } from 'react';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, Download, RefreshCw } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import * as signalR from '@microsoft/signalr';
+import { WEBHOOK_CONFIG } from '../config/webhooks';
+import toast from 'react-hot-toast';
+
+const VideoCallPage = ({ identityPrefix }) => {
+  const { roomName: urlRoomName } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const localVideoRef = useRef(null);
+  const hubConnectionRef = useRef(null);
+  const roomRef = useRef(null);
+  const hasJoinedRef = useRef(false);
+  const chatScrollRef = useRef(null);
+  const recordingCheckIntervalRef = useRef(null);
+
+  const [resolvedRoomName, setResolvedRoomName] = useState(urlRoomName);
+  const [roomSid, setRoomSid] = useState(null);
+  const [participants, setParticipants] = useState([]);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState('Initializing...');
+  const [error, setError] = useState(null);
+
+  const [isVideoEnabled, setIsVideoEnabled] = useState(true);
+  const [isAudioEnabled, setIsAudioEnabled] = useState(true);
+
+  const [chatMessages, setChatMessages] = useState([]);
+  const [smsInput, setSmsInput] = useState('');
+  const [identity, setIdentity] = useState('');
+
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
+
+  // Recording state
+  const [recordingSid, setRecordingSid] = useState(null);
+  const [compositionSid, setCompositionSid] = useState(null);
+  const [recordingType, setRecordingType] = useState(null); // 'recording' or 'composition'
+  const [isRecording, setIsRecording] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState(null);
+  const [isRecordingBusy, setIsRecordingBusy] = useState(false);
+  const [status, setStatus] = useState(null);
+  const [recordingStatus, setRecordingStatus] = useState('');
+
+  const isPatient = identityPrefix === 'patient';
+  const themeColor = isPatient ? 'blue' : 'green';
+
+  const backendBaseUrl =
+    (WEBHOOK_CONFIG && WEBHOOK_CONFIG.BACKEND_BASE_URL) ||
+    process.env.REACT_APP_BACKEND_URL ||
+    'https://localhost:5001';
+  const normalizedBackendUrl = backendBaseUrl.replace(/\/+$/, '');
+
+  // --- attach / detach helpers ---
+  const attachTrack = (track, container) => {
+    if (!track || !container) return;
+    const el = track.attach();
+    container.appendChild(el);
+  };
+
+  const detachTrack = (track) => {
+    if (!track) return;
+    (track.detach ? track.detach() : []).forEach((el) => el.remove());
+  };
+
+  // --- cleanup ---
+  const cleanupConnections = async () => {
+    try { 
+      if (roomRef.current) {
+        roomRef.current.disconnect(); 
+        roomRef.current = null; 
+      }
+    } catch (error) {
+      console.warn('Error disconnecting room:', error);
+    }
+    
+    try { 
+      if (hubConnectionRef.current) {
+        await hubConnectionRef.current.stop(); 
+        hubConnectionRef.current = null; 
+      }
+    } catch (error) {
+      console.warn('Error stopping hub connection:', error);
+    }
+    
+    if (recordingCheckIntervalRef.current) {
+      clearInterval(recordingCheckIntervalRef.current);
+      recordingCheckIntervalRef.current = null;
+    }
+    
+    hasJoinedRef.current = false;
+    setIsConnected(false);
+  };
+
+  // --- trigger download helper ---
+  const triggerDownloadViaFetch = async (url, suggestedFilename) => {
+    try {
+      setStatus('Downloading recording...');
+      
+      const downloadResp = await fetch(`${normalizedBackendUrl}/api/video/download-recording`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          mediaUrl: url,
+          recordingSid: recordingSid
+        })
+      });
+      
+      if (!downloadResp.ok) {
+        const errorText = await downloadResp.text();
+        throw new Error(`Download failed: ${downloadResp.status} ${errorText}`);
+      }
+      
+      const blob = await downloadResp.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = suggestedFilename || `recording_${compositionSid || recordingSid || Date.now()}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(blobUrl);
+      setStatus('Download started');
+      toast.success('Download started.');
+    } catch (err) {
+      console.error('triggerDownload error:', err);
+      setStatus('Download failed.');
+      toast.error(err.message || 'Download failed.');
+    }
+  };
+
+  // --- leave call handler ---
+  const leaveCall = async () => {
+    try {
+      await cleanupConnections();
+      navigate('/thank-you');
+    } catch (err) {
+      console.error('Error leaving call:', err);
+      toast.error('Error leaving call');
+      try { await cleanupConnections(); } catch {}
+      navigate('/');
+    }
+  };
+
+  const handlePublication = (participantSid, publication) => {
+    if (publication.track) {
+      const container = document.getElementById(`participant-${participantSid}`);
+      if (container) attachTrack(publication.track, container);
+    }
+    publication.on('subscribed', (track) => {
+      const container = document.getElementById(`participant-${participantSid}`);
+      if (container) attachTrack(track, container);
+    });
+    publication.on('unsubscribed', (track) => detachTrack(track));
+  };
+
+  const handleParticipantConnected = (participant) => {
+    if (participant.identity === roomRef.current?.localParticipant.identity) return;
+    setParticipants((prev) => prev.some((p) => p.sid === participant.sid) ? prev : [...prev, participant]);
+    participant.tracks.forEach((pub) => handlePublication(participant.sid, pub));
+    participant.on('trackPublished', (pub) => handlePublication(participant.sid, pub));
+    participant.on('trackUnpublished', (pub) => pub.track && detachTrack(pub.track));
+  };
+
+  const handleParticipantDisconnected = (participant) => {
+    setParticipants((prev) => prev.filter((p) => p.sid !== participant.sid));
+    participant.tracks.forEach((pub) => pub.track && detachTrack(pub.track));
+  };
+
+  // Check recording status periodically
+  const checkRecordingStatus = async () => {
+    try {
+      let sid = recordingType === 'recording' ? recordingSid : compositionSid;
+      if (!sid) return;
+
+      const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}?type=${recordingType}`);
+      if (res.ok) {
+        const data = await res.json();
+        setRecordingStatus(data.status);
+        
+        if (data.status === 'completed' && data.downloadUrl) {
+          setDownloadUrl(data.downloadUrl);
+          setIsRecording(false);
+          setStatus('Recording complete. Ready for download.');
+          toast.success('Recording ready for download.');
+          if (recordingCheckIntervalRef.current) {
+            clearInterval(recordingCheckIntervalRef.current);
+            recordingCheckIntervalRef.current = null;
+          }
+        } else if (data.status === 'failed') {
+          setIsRecording(false);
+          setStatus('Recording failed.');
+          toast.error('Recording failed.');
+          if (recordingCheckIntervalRef.current) {
+            clearInterval(recordingCheckIntervalRef.current);
+            recordingCheckIntervalRef.current = null;
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Error checking recording status:', err);
+    }
+  };
+
+  // --- join room ---
+  useEffect(() => {
+    const joinRoom = async () => {
+      if (hasJoinedRef.current) return;
+      hasJoinedRef.current = true;
+      
+      try {
+        await cleanupConnections();
+        setIsConnecting(true);
+        setConnectionStatus('Connecting...');
+        
+        const queryParams = new URLSearchParams(location.search);
+        const idFromUrl = queryParams.get('identity');
+        const id = idFromUrl || `${identityPrefix}_${Math.floor(Math.random() * 10000)}`;
+        setIdentity(id);
+
+        const tokenResp = await fetch(`${normalizedBackendUrl}/api/video/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identity: id, roomName: urlRoomName, userType: identityPrefix }),
+        });
+        
+        if (!tokenResp.ok) {
+          const errorText = await tokenResp.text();
+          throw new Error(`Failed to get token: ${tokenResp.status} ${errorText}`);
+        }
+        
+        const { token, roomName: serverRoomName } = await tokenResp.json();
+
+        // Dynamically import twilio-video to reduce bundle size
+        const VideoLib = await import('twilio-video');
+
+        // Try to get user media, but don't fail if not available
+        const tracks = [];
+        try {
+          if (isVideoEnabled) {
+            const videoTrack = await VideoLib.createLocalVideoTrack().catch(() => {
+              setIsVideoEnabled(false);
+              toast.error('Camera not available');
+              return null;
+            });
+            if (videoTrack) tracks.push(videoTrack);
+          }
+        } catch (e) {
+          setIsVideoEnabled(false);
+          console.warn('Video not available:', e);
+        }
+
+        try {
+          if (isAudioEnabled) {
+            const audioTrack = await VideoLib.createLocalAudioTrack().catch(() => {
+              setIsAudioEnabled(false);
+              toast.error('Microphone not available');
+              return null;
+            });
+            if (audioTrack) tracks.push(audioTrack);
+          }
+        } catch (e) {
+          setIsAudioEnabled(false);
+          console.warn('Audio not available:', e);
+        }
+
+        const connectedRoom = await VideoLib.connect(token, { 
+          name: serverRoomName || urlRoomName, 
+          tracks,
+          dominantSpeaker: true,
+          networkQuality: true,
+          preferredVideoCodecs: [{ codec: 'VP8', simulcast: true }]
+        });
+        
+        roomRef.current = connectedRoom;
+        setResolvedRoomName(serverRoomName || urlRoomName);
+        setIsConnected(true);
+        setIsConnecting(false);
+        setConnectionStatus('Connected');
+
+        // Get the room SID for recording
+        setRoomSid(connectedRoom.sid);
+
+        // Attach local video track
+        connectedRoom.localParticipant.videoTracks.forEach((pub) => { 
+          if(pub.track) attachTrack(pub.track, localVideoRef.current); 
+        });
+        
+        // Handle existing and new participants
+        connectedRoom.participants.forEach(handleParticipantConnected);
+        connectedRoom.on('participantConnected', handleParticipantConnected);
+        connectedRoom.on('participantDisconnected', handleParticipantDisconnected);
+        
+        connectedRoom.on('disconnected', (disconnectedRoom) => {
+          setIsConnected(false);
+          setConnectionStatus('Disconnected');
+          disconnectedRoom.localParticipant.tracks.forEach((pub) => pub.track && detachTrack(pub.track));
+        });
+
+        // Setup SignalR chat connection
+        if (!hubConnectionRef.current) {
+          const hubConnection = new signalR.HubConnectionBuilder()
+            .withUrl(`${normalizedBackendUrl}/chathub?roomName=${encodeURIComponent(serverRoomName || urlRoomName)}&identity=${encodeURIComponent(id)}`)
+            .withAutomaticReconnect()
+            .build();
+          
+          hubConnection.on('ReceiveMessage', (user, message) => {
+            setChatMessages((prev) => [...prev, { 
+              from: user, 
+              text: message, 
+              self: user === id, 
+              timestamp: new Date().toISOString() 
+            }]);
+          });
+          
+          hubConnection.on('ForceDisconnect', async () => { 
+            toast.error('Another session is using your identity.'); 
+            await cleanupConnections(); 
+          });
+          
+          await hubConnection.start();
+          hubConnectionRef.current = hubConnection;
+        }
+      } catch (err) {
+        setError(err.message || 'Connection failed.');
+        setIsConnecting(false);
+        setConnectionStatus('Failed');
+        hasJoinedRef.current = false;
+        console.error('Join room error:', err);
+        toast.error('Failed to join the video call');
+      }
+    };
+
+    if (urlRoomName) {
+      joinRoom();
+    }
+    
+    return () => {
+      cleanupConnections();
+    };
+  }, [urlRoomName, identityPrefix, location.search, normalizedBackendUrl]);
+
+  // --- chat helpers ---
+  const scrollToBottom = () => { 
+    if(chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; 
+    }
+  };
+  
+  useEffect(() => {
+    if(!chatScrollRef.current) return; 
+    const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; 
+    setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50));
+  }, [chatMessages]);
+  
+  const handleScroll = () => {
+    if(!chatScrollRef.current) return; 
+    const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; 
+    setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50));
+  };
+
+  const toggleVideo = async () => {
+    if(!roomRef.current) return;
+    
+    if(isVideoEnabled){
+      roomRef.current.localParticipant.videoTracks.forEach(pub => {
+        detachTrack(pub.track); 
+        pub.track.stop?.(); 
+        roomRef.current.localParticipant.unpublishTrack(pub.track);
+      });
+      setIsVideoEnabled(false);
+    } else { 
+      try { 
+        const VideoLib = await import('twilio-video');
+        const track = await VideoLib.createLocalVideoTrack().catch(() => {
+          toast.error('Camera not available');
+          return null;
+        });
+        if (track) {
+          roomRef.current.localParticipant.publishTrack(track); 
+          attachTrack(track, localVideoRef.current); 
+          setIsVideoEnabled(true);
+        }
+      } catch { 
+        toast.error('Unable to start video.'); 
+      } 
+    } 
+  };
+  
+  const toggleAudio = async () => {
+    if(!roomRef.current) return;
+    
+    if(isAudioEnabled){
+      roomRef.current.localParticipant.audioTracks.forEach(pub => {
+        pub.track.stop?.(); 
+        roomRef.current.localParticipant.unpublishTrack(pub.track);
+      });
+      setIsAudioEnabled(false);
+    } else { 
+      try { 
+        const VideoLib = await import('twilio-video');
+        const track = await VideoLib.createLocalAudioTrack().catch(() => {
+          toast.error('Microphone not available');
+          return null;
+        });
+        if (track) {
+          roomRef.current.localParticipant.publishTrack(track); 
+          setIsAudioEnabled(true);
+        }
+      } catch { 
+        toast.error('No microphone available.'); 
+      } 
+    } 
+  };
+  
+  const sendChat = async () => { 
+    if(!smsInput.trim() || !hubConnectionRef.current) return; 
+    const msg = smsInput.trim(); 
+    setSmsInput(''); 
+    try { 
+      await hubConnectionRef.current.invoke('SendMessage', resolvedRoomName, identity, msg); 
+    } catch (err) { 
+      console.error('Chat send failed:', err); 
+      toast.error('Failed to send message');
+    } 
+  };
+
+  // --- Recording handlers ---
+  const startRecording = async () => {
+    if(isRecordingBusy) return;
+    setIsRecordingBusy(true); 
+    setStatus(null);
+    setRecordingStatus('');
+    
+    try {
+      if(!resolvedRoomName || !roomSid) {
+        throw new Error('Room information not available. Please wait for connection to complete.');
+      }
+
+      const requestBody = {
+        RoomSid: roomSid,
+        RoomName: resolvedRoomName
+      };
+        
+      const res = await fetch(`${normalizedBackendUrl}/api/video/start-recording`, { 
+        method:'POST', 
+        headers:{'Content-Type':'application/json'}, 
+        body:JSON.stringify(requestBody) 
+      });
+      
+      if(!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Start failed: ${res.status} ${errorText}`);
+      }
+      
+      const data = await res.json();
+      
+      if (data.type === 'recording') {
+        setRecordingSid(data.recordingSid);
+        setRecordingType('recording');
+      } else {
+        setCompositionSid(data.compositionSid);
+        setRecordingType('composition');
+      }
+      
+      setIsRecording(true); 
+      setDownloadUrl(null); 
+      setStatus('Recording started...');
+      setRecordingStatus('enqueued');
+      
+      // Start checking recording status periodically
+      if (recordingCheckIntervalRef.current) {
+        clearInterval(recordingCheckIntervalRef.current);
+      }
+      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 3000); // Check every 3 seconds
+      
+      toast.success('Recording started.');
+    } catch(err){ 
+      console.error(err); 
+      setStatus(err.message); 
+      toast.error(err.message); 
+    } finally{ 
+      setIsRecordingBusy(false); 
+    }
+  };
+ const stopRecording = async () => {
+    if ((!recordingSid && !compositionSid) && (!roomSid || !resolvedRoomName)) {
+      toast.error('Insufficient recording information to stop recording.');
+      return;
+    }
+
+    setIsRecordingBusy(true);
+    setStatus('Stopping recording...');
+    
+    try {
+      const requestBody = {
+        RecordingSid: recordingSid,
+        CompositionSid: compositionSid,
+        RoomSid: roomSid || '',
+        RoomName: resolvedRoomName || ''
+      };
+
+      const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(requestBody)
+      });
+      
+      if(!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Stop failed: ${res.status} ${errorText}`);
+      }
+      
+      const data = await res.json();
+      
+      // Update state based on response type
+      if (data.type === 'recording') {
+        setRecordingSid(data.recordingSid || data.sid);
+        setRecordingType('recording');
+      } else if (data.type === 'composition') {
+        setCompositionSid(data.compositionSid || data.sid);
+        setRecordingType('composition');
+      }
+      
+      if (data.status === 'completed') {
+        setDownloadUrl(data.downloadUrl);
+        setIsRecording(false);
+        setStatus('Recording complete. Ready for download.');
+        setRecordingStatus('completed');
+        toast.success('Recording ready for download.');
+        
+        if (recordingCheckIntervalRef.current) {
+          clearInterval(recordingCheckIntervalRef.current);
+          recordingCheckIntervalRef.current = null;
+        }
+      } else {
+        setRecordingStatus(data.status || 'processing');
+        setStatus(`Recording is ${data.status || 'processing'}...`);
+        
+        if (recordingCheckIntervalRef.current) {
+          clearInterval(recordingCheckIntervalRef.current);
+        }
+        
+        // Start checking status periodically
+        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 3000);
+        
+        toast.success(`Recording is ${data.status || 'processing'}. Download will be available soon.`);
+      }
+    } catch(err){
+      console.error('Error in stopRecording:', err); 
+      setStatus('Error while stopping recording.'); 
+      toast.error(err.message); 
+    } finally{ 
+      setIsRecordingBusy(false); 
+    }
+  };
+
+  const downloadRecording = async () => {
+    if (!downloadUrl) return;
+    await triggerDownloadViaFetch(downloadUrl, `recording_${compositionSid || recordingSid}.mp4`);
+  };
+
+  const refreshRecordingStatus = async () => {
+    if (!recordingSid && !compositionSid) return;
+    await checkRecordingStatus();
+    toast.success('Recording status refreshed');
+  };
+
+  // --- Render ---
+  const uniqueParticipants = participants.reduce((acc, curr) => {
+    if(!acc.some(p => p.sid === curr.sid)) acc.push(curr); 
+    return acc;
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-gray-900 flex flex-col">
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-3">
+        {/* Video Area */}
+        <div className="lg:col-span-2 relative p-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+          <AnimatePresence>
+            {uniqueParticipants.length === 0 && (
+              <motion.div 
+                key="waiting" 
+                className="flex items-center justify-center bg-gray-800 text-white col-span-full rounded-lg"
+              >
+                {isConnecting ? 'Connecting...' : 'Waiting for participants...'}
+              </motion.div>
+            )}
+            
+            {uniqueParticipants.map(participant => (
+              <motion.div 
+                key={`participant-${participant.sid}`} 
+                id={`participant-${participant.sid}`} 
+                className="relative bg-black rounded-lg overflow-hidden"
+              >
+                <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">
+                  {participant.identity}
+                </span>
+              </motion.div>
+            ))}
+            
+            <div ref={localVideoRef} className="relative bg-black rounded-lg overflow-hidden">
+              <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">
+                You
+              </span>
+            </div>
+          </AnimatePresence>
+        </div>
+
+        {/* Chat & Controls */}
+        <div className="flex flex-col p-2 space-y-2">
+          <div className="flex-1 overflow-y-auto border rounded p-2 bg-gray-800" ref={chatScrollRef} onScroll={handleScroll}>
+            {chatMessages.length === 0 ? (
+              <div className="text-gray-400 text-center p-4">No messages yet</div>
+            ) : (
+              chatMessages.map((msg, idx) => (
+                <div key={idx} className={`p-1 ${msg.self ? 'text-right' : 'text-left'}`}>
+                  <div className="inline-block bg-gray-700 text-white px-2 py-1 rounded">
+                    {msg.text}
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    {msg.from} • {new Date(msg.timestamp).toLocaleTimeString()}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          {showScrollToLatest && (
+            <button 
+              onClick={scrollToBottom} 
+              className="bg-blue-500 text-white p-1 rounded text-sm"
+            >
+              Scroll to latest
+            </button>
+          )}
+
+          <div className="flex space-x-2">
+            <input 
+              type="text" 
+              value={smsInput} 
+              onChange={(e) => setSmsInput(e.target.value)} 
+              placeholder="Type a message..." 
+              className="flex-1 p-2 rounded bg-gray-700 text-white"
+              onKeyPress={(e) => e.key === 'Enter' && sendChat()}
+            />
+            <button 
+              onClick={sendChat} 
+              className="bg-blue-500 p-2 rounded text-white"
+              disabled={!smsInput.trim()}
+            >
+              <Send size={16}/>
+            </button>
+          </div>
+
+          {/* Recording Status Display */}
+          {(recordingStatus || recordingType) && (
+            <div className="p-2 bg-gray-800 rounded text-white text-sm">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span>Type: {recordingType || 'unknown'} | </span>
+                  <span>Status: {recordingStatus || 'checking'}</span>
+                </div>
+                {recordingStatus !== 'completed' && (
+                  <button 
+                    onClick={refreshRecordingStatus}
+                    className="p-1 bg-gray-700 rounded"
+                    title="Refresh status"
+                  >
+                    <RefreshCw size={14} />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="flex space-x-2 justify-center flex-wrap">
+            <button 
+              onClick={toggleVideo} 
+              className={`p-2 rounded ${isVideoEnabled ? 'bg-green-600' : 'bg-gray-600'} text-white`}
+              title={isVideoEnabled ? 'Turn off video' : 'Turn on video'}
+            >
+              {isVideoEnabled ? <Video size={16}/> : <VideoOff size={16}/>}
+            </button>
+            
+            <button 
+              onClick={toggleAudio} 
+              className={`p-2 rounded ${isAudioEnabled ? 'bg-green-600' : 'bg-gray-600'} text-white`}
+              title={isAudioEnabled ? 'Mute microphone' : 'Unmute microphone'}
+            >
+              {isAudioEnabled ? <Mic size={16}/> : <MicOff size={16}/>}
+            </button>
+            
+            <button 
+              onClick={leaveCall} 
+              className="p-2 rounded bg-red-600 text-white"
+              title="Leave call"
+            >
+              <PhoneOff size={16}/>
+            </button>
+            
+            <button 
+              onClick={startRecording} 
+              disabled={isRecording || isRecordingBusy || !isConnected}
+              className="p-2 rounded bg-yellow-600 text-white disabled:bg-gray-600"
+              title="Start recording"
+            >
+              Start Recording
+            </button>
+            
+            <button 
+              onClick={stopRecording} 
+              disabled={!isRecording || isRecordingBusy}
+              className="p-2 rounded bg-orange-600 text-white disabled:bg-gray-600"
+              title="Stop recording"
+            >
+              Stop Recording
+            </button>
+            
+            {downloadUrl && (
+              <button 
+                onClick={downloadRecording} 
+                className="p-2 rounded bg-green-600 text-white"
+                title="Download recording"
+              >
+                <Download size={16} />
+              </button>
+            )}
+          </div>
+
+          {status && (
+            <div className="text-sm text-white text-center p-2 bg-gray-800 rounded">
+              {status}
+            </div>
+          )}
+
+          {error && (
+            <div className="text-sm text-red-400 text-center p-2 bg-gray-800 rounded">
+              Error: {error}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default VideoCallPage;
+
+
+
+
