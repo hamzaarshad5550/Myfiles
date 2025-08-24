@@ -1,7 +1,6 @@
-// VideoCallPage.jsx
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, Download } from 'lucide-react';
+import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, Download, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as signalR from '@microsoft/signalr';
 import { WEBHOOK_CONFIG } from '../config/webhooks';
@@ -13,8 +12,6 @@ const VideoCallPage = ({ identityPrefix }) => {
   const navigate = useNavigate();
 
   const localVideoRef = useRef(null);
-  const blurredBgRef = useRef(null);
-  const VideoLibRef = useRef(null);
   const hubConnectionRef = useRef(null);
   const roomRef = useRef(null);
   const hasJoinedRef = useRef(false);
@@ -39,22 +36,23 @@ const VideoCallPage = ({ identityPrefix }) => {
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
 
   // Recording state
+  const [recordingSid, setRecordingSid] = useState(null);
   const [compositionSid, setCompositionSid] = useState(null);
+  const [recordingType, setRecordingType] = useState(null);
   const [isRecording, setIsRecording] = useState(false);
   const [downloadUrl, setDownloadUrl] = useState(null);
   const [isRecordingBusy, setIsRecordingBusy] = useState(false);
   const [status, setStatus] = useState(null);
+  const [recordingStatus, setRecordingStatus] = useState('');
 
   const isPatient = identityPrefix === 'patient';
-  const themeColor = isPatient ? 'blue' : 'green';
-
   const backendBaseUrl =
     (WEBHOOK_CONFIG && WEBHOOK_CONFIG.BACKEND_BASE_URL) ||
     process.env.REACT_APP_BACKEND_URL ||
     'https://localhost:5001';
   const normalizedBackendUrl = backendBaseUrl.replace(/\/+$/, '');
 
-  // --- attach / detach helpers ---
+  // --- Helper functions ---
   const attachTrack = (track, container) => {
     if (!track || !container) return;
     const el = track.attach();
@@ -66,37 +64,57 @@ const VideoCallPage = ({ identityPrefix }) => {
     (track.detach ? track.detach() : []).forEach((el) => el.remove());
   };
 
-  // --- cleanup ---
   const cleanupConnections = async () => {
-    try { roomRef.current?.disconnect(); roomRef.current = null; } catch {}
-    try { await hubConnectionRef.current?.stop(); hubConnectionRef.current = null; } catch {}
+    try { 
+      if (roomRef.current) {
+        roomRef.current.disconnect(); 
+        roomRef.current = null; 
+      }
+    } catch (error) {
+      console.warn('Error disconnecting room:', error);
+    }
+    
+    try { 
+      if (hubConnectionRef.current) {
+        await hubConnectionRef.current.stop(); 
+        hubConnectionRef.current = null; 
+      }
+    } catch (error) {
+      console.warn('Error stopping hub connection:', error);
+    }
+    
     if (recordingCheckIntervalRef.current) {
       clearInterval(recordingCheckIntervalRef.current);
       recordingCheckIntervalRef.current = null;
     }
+    
     hasJoinedRef.current = false;
     setIsConnected(false);
   };
 
-  // --- trigger download helper ---
   const triggerDownloadViaFetch = async (url, suggestedFilename) => {
     try {
       setStatus('Downloading recording...');
       
-      // Use backend proxy for download to handle authentication
       const downloadResp = await fetch(`${normalizedBackendUrl}/api/video/download-recording`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mediaUrl: url })
+        body: JSON.stringify({ 
+          mediaUrl: url,
+          recordingSid: recordingSid
+        })
       });
       
-      if (!downloadResp.ok) throw new Error(`Download failed: ${downloadResp.status}`);
+      if (!downloadResp.ok) {
+        const errorText = await downloadResp.text();
+        throw new Error(`Download failed: ${downloadResp.status} ${errorText}`);
+      }
       
       const blob = await downloadResp.blob();
       const blobUrl = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = blobUrl;
-      a.download = suggestedFilename || `recording_${compositionSid || Date.now()}.mp4`;
+      a.download = suggestedFilename || `recording_${compositionSid || recordingSid || Date.now()}.mp4`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -110,7 +128,6 @@ const VideoCallPage = ({ identityPrefix }) => {
     }
   };
 
-  // --- leave call handler ---
   const leaveCall = async () => {
     try {
       await cleanupConnections();
@@ -148,12 +165,16 @@ const VideoCallPage = ({ identityPrefix }) => {
     participant.tracks.forEach((pub) => pub.track && detachTrack(pub.track));
   };
 
-  // Check recording status periodically
-  const checkRecordingStatus = async (sid) => {
+  const checkRecordingStatus = async () => {
     try {
-      const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}`);
+      let sid = recordingType === 'recording' ? recordingSid : compositionSid;
+      if (!sid) return;
+
+      const res = await fetch(`${normalizedBackendUrl}/api/video/recording-status/${sid}?type=${recordingType}`);
       if (res.ok) {
         const data = await res.json();
+        setRecordingStatus(data.status);
+        
         if (data.status === 'completed' && data.downloadUrl) {
           setDownloadUrl(data.downloadUrl);
           setIsRecording(false);
@@ -163,7 +184,11 @@ const VideoCallPage = ({ identityPrefix }) => {
             clearInterval(recordingCheckIntervalRef.current);
             recordingCheckIntervalRef.current = null;
           }
-        } else if (data.status === 'failed') {
+        } 
+        else if (data.status === 'enqueued' || data.status === 'processing') {
+          setStatus(`Recording is ${data.status}. Still processing...`);
+        }
+        else if (data.status === 'failed') {
           setIsRecording(false);
           setStatus('Recording failed.');
           toast.error('Recording failed.');
@@ -178,15 +203,17 @@ const VideoCallPage = ({ identityPrefix }) => {
     }
   };
 
-  // --- join room ---
+  // --- Room connection ---
   useEffect(() => {
     const joinRoom = async () => {
       if (hasJoinedRef.current) return;
       hasJoinedRef.current = true;
+      
       try {
         await cleanupConnections();
         setIsConnecting(true);
         setConnectionStatus('Connecting...');
+        
         const queryParams = new URLSearchParams(location.search);
         const idFromUrl = queryParams.get('identity');
         const id = idFromUrl || `${identityPrefix}_${Math.floor(Math.random() * 10000)}`;
@@ -197,13 +224,17 @@ const VideoCallPage = ({ identityPrefix }) => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ identity: id, roomName: urlRoomName, userType: identityPrefix }),
         });
-        if (!tokenResp.ok) throw new Error(`Failed to get token: ${tokenResp.status}`);
+        
+        if (!tokenResp.ok) {
+          const errorText = await tokenResp.text();
+          throw new Error(`Failed to get token: ${tokenResp.status} ${errorText}`);
+        }
+        
         const { token, roomName: serverRoomName } = await tokenResp.json();
 
         const VideoLib = await import('twilio-video');
-        VideoLibRef.current = VideoLib;
 
-        // Try to get user media, but don't fail if not available
+        // Try to get user media
         const tracks = [];
         try {
           if (isVideoEnabled) {
@@ -247,31 +278,45 @@ const VideoCallPage = ({ identityPrefix }) => {
         setIsConnecting(false);
         setConnectionStatus('Connected');
 
-        // Get the room SID for recording
         setRoomSid(connectedRoom.sid);
 
+        // Attach local video track
         connectedRoom.localParticipant.videoTracks.forEach((pub) => { 
           if(pub.track) attachTrack(pub.track, localVideoRef.current); 
         });
         
+        // Handle participants
         connectedRoom.participants.forEach(handleParticipantConnected);
         connectedRoom.on('participantConnected', handleParticipantConnected);
         connectedRoom.on('participantDisconnected', handleParticipantDisconnected);
+        
         connectedRoom.on('disconnected', (disconnectedRoom) => {
           setIsConnected(false);
           setConnectionStatus('Disconnected');
           disconnectedRoom.localParticipant.tracks.forEach((pub) => pub.track && detachTrack(pub.track));
         });
 
+        // Setup SignalR chat
         if (!hubConnectionRef.current) {
           const hubConnection = new signalR.HubConnectionBuilder()
             .withUrl(`${normalizedBackendUrl}/chathub?roomName=${encodeURIComponent(serverRoomName || urlRoomName)}&identity=${encodeURIComponent(id)}`)
             .withAutomaticReconnect()
             .build();
+          
           hubConnection.on('ReceiveMessage', (user, message) => {
-            setChatMessages((prev) => [...prev, { from: user, text: message, self: user === id, timestamp: new Date().toISOString() }]);
+            setChatMessages((prev) => [...prev, { 
+              from: user, 
+              text: message, 
+              self: user === id, 
+              timestamp: new Date().toISOString() 
+            }]);
           });
-          hubConnection.on('ForceDisconnect', async () => { toast.error('Another session is using your identity.'); await cleanupConnections(); });
+          
+          hubConnection.on('ForceDisconnect', async () => { 
+            toast.error('Another session is using your identity.'); 
+            await cleanupConnections(); 
+          });
+          
           await hubConnection.start();
           hubConnectionRef.current = hubConnection;
         }
@@ -281,21 +326,43 @@ const VideoCallPage = ({ identityPrefix }) => {
         setConnectionStatus('Failed');
         hasJoinedRef.current = false;
         console.error('Join room error:', err);
+        toast.error('Failed to join the video call');
       }
     };
-    if (urlRoomName) joinRoom();
-    return () => cleanupConnections();
+
+    if (urlRoomName) {
+      joinRoom();
+    }
+    
+    return () => {
+      cleanupConnections();
+    };
   }, [urlRoomName, identityPrefix, location.search, normalizedBackendUrl]);
 
-  // --- chat helpers ---
-  const scrollToBottom = () => { if(chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; };
-  useEffect(() => { if(!chatScrollRef.current) return; const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50)); }, [chatMessages]);
-  const handleScroll = () => { if(!chatScrollRef.current) return; const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50)); };
+  // --- Chat helpers ---
+  const scrollToBottom = () => { 
+    if(chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; 
+    }
+  };
   
+  useEffect(() => {
+    if(!chatScrollRef.current) return; 
+    const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; 
+    setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50));
+  }, [chatMessages]);
+  
+  const handleScroll = () => {
+    if(!chatScrollRef.current) return; 
+    const { scrollTop, scrollHeight, clientHeight } = chatScrollRef.current; 
+    setShowScrollToLatest(!(scrollHeight - scrollTop <= clientHeight + 50));
+  };
+
   const toggleVideo = async () => {
-    if(!roomRef.current || !VideoLibRef.current) return;
+    if(!roomRef.current) return;
+    
     if(isVideoEnabled){
-      roomRef.current.localParticipant.videoTracks.forEach(pub=>{
+      roomRef.current.localParticipant.videoTracks.forEach(pub => {
         detachTrack(pub.track); 
         pub.track.stop?.(); 
         roomRef.current.localParticipant.unpublishTrack(pub.track);
@@ -303,7 +370,8 @@ const VideoCallPage = ({ identityPrefix }) => {
       setIsVideoEnabled(false);
     } else { 
       try { 
-        const track = await VideoLibRef.current.createLocalVideoTrack().catch(() => {
+        const VideoLib = await import('twilio-video');
+        const track = await VideoLib.createLocalVideoTrack().catch(() => {
           toast.error('Camera not available');
           return null;
         });
@@ -319,16 +387,18 @@ const VideoCallPage = ({ identityPrefix }) => {
   };
   
   const toggleAudio = async () => {
-    if(!roomRef.current || !VideoLibRef.current) return;
+    if(!roomRef.current) return;
+    
     if(isAudioEnabled){
-      roomRef.current.localParticipant.audioTracks.forEach(pub=>{
+      roomRef.current.localParticipant.audioTracks.forEach(pub => {
         pub.track.stop?.(); 
         roomRef.current.localParticipant.unpublishTrack(pub.track);
       });
       setIsAudioEnabled(false);
     } else { 
       try { 
-        const track = await VideoLibRef.current.createLocalAudioTrack().catch(() => {
+        const VideoLib = await import('twilio-video');
+        const track = await VideoLib.createLocalAudioTrack().catch(() => {
           toast.error('Microphone not available');
           return null;
         });
@@ -350,6 +420,7 @@ const VideoCallPage = ({ identityPrefix }) => {
       await hubConnectionRef.current.invoke('SendMessage', resolvedRoomName, identity, msg); 
     } catch (err) { 
       console.error('Chat send failed:', err); 
+      toast.error('Failed to send message');
     } 
   };
 
@@ -358,10 +429,13 @@ const VideoCallPage = ({ identityPrefix }) => {
     if(isRecordingBusy) return;
     setIsRecordingBusy(true); 
     setStatus(null);
+    setRecordingStatus('');
+    
     try {
-      if(!resolvedRoomName || !roomSid) throw new Error('Room information not available. Both RoomSid and RoomName are required.');
+      if(!resolvedRoomName || !roomSid) {
+        throw new Error('Room information not available. Please wait for connection to complete.');
+      }
 
-      // Always include both RoomSid and RoomName as backend requires both
       const requestBody = {
         RoomSid: roomSid,
         RoomName: resolvedRoomName
@@ -373,24 +447,42 @@ const VideoCallPage = ({ identityPrefix }) => {
         body:JSON.stringify(requestBody) 
       });
       
-      if(!res.ok) throw new Error(`Start failed: ${res.status} ${await res.text()}`);
+      if(!res.ok) {
+        let errorDetails = '';
+        try {
+          const errorData = await res.json();
+          errorDetails = errorData.details || errorData.error || await res.text();
+        } catch {
+          errorDetails = await res.text();
+        }
+        
+        throw new Error(`Start failed: ${res.status} ${errorDetails}`);
+      }
+      
       const data = await res.json();
-      const sid = data.compositionSid || data.sid;
-      if(!sid) throw new Error('No compositionSid returned.');
-      setCompositionSid(sid); 
+      
+      // Set the appropriate SID based on recording type
+      if (data.type === 'recording') {
+        setRecordingSid(data.recordingSid);
+        setRecordingType('recording');
+      } else {
+        setCompositionSid(data.compositionSid);
+        setRecordingType('composition');
+      }
+      
       setIsRecording(true); 
       setDownloadUrl(null); 
       setStatus('Recording started...');
+      setRecordingStatus('enqueued');
       
-      // Start checking recording status periodically
       if (recordingCheckIntervalRef.current) {
         clearInterval(recordingCheckIntervalRef.current);
       }
-      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(sid), 5000);
+      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 3000);
       
       toast.success('Recording started.');
     } catch(err){ 
-      console.error(err); 
+      console.error('Start recording error:', err); 
       setStatus(err.message); 
       toast.error(err.message); 
     } finally{ 
@@ -399,164 +491,331 @@ const VideoCallPage = ({ identityPrefix }) => {
   };
 
   const stopRecording = async () => {
-    console.log('stopRecording called with:', {
-      compositionSid,
-      roomSid,
-      resolvedRoomName
-    });
-
-    // Check if we have enough information to stop recording
-    if (!compositionSid && (!roomSid || !resolvedRoomName)) {
+    if (!compositionSid && !recordingSid && (!roomSid || !resolvedRoomName)) {
       toast.error('Insufficient recording information to stop recording.');
       return;
     }
 
-    // If using CompositionSid but missing room info, warn but continue
-    if (compositionSid && (!roomSid || !resolvedRoomName)) {
-      console.warn('CompositionSid available but missing room info. Backend may require all fields.');
-    }
-
     setIsRecordingBusy(true);
     setStatus('Stopping recording...');
+    
     try {
-      // Use CompositionSid if available (preferred method)
-      if (compositionSid) {
-        // Backend requires all fields even when using CompositionSid
-        const requestBody = {
-          CompositionSid: compositionSid,
-          RoomSid: roomSid || '',
-          RoomName: resolvedRoomName || ''
-        };
+      const requestBody = {
+        RecordingSid: recordingSid || "",
+        CompositionSid: compositionSid || "",
+        RoomSid: roomSid || "",
+        RoomName: resolvedRoomName || ""
+      };
 
-        console.log('Sending stop recording request with CompositionSid:', requestBody);
-
-        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(requestBody)
-        });
-        
-        if(!res.ok) {
-          const errorText = await res.text();
-          throw new Error(`Stop failed: ${res.status} ${errorText}`);
+      const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (!res.ok) {
+        let errorDetails = '';
+        try {
+          const errorData = await res.json();
+          errorDetails = errorData.details || errorData.error || JSON.stringify(errorData);
+        } catch {
+          errorDetails = await res.text();
         }
         
-        const data = await res.json();
-        handleStopResponse(data);
-      } 
-      // Fallback to room-based approach if CompositionSid is not available
-      else if (roomSid && resolvedRoomName) {
-        // Send both RoomSid and RoomName (both are required by backend)
-        const requestBody = {
-          RoomSid: roomSid,
-          RoomName: resolvedRoomName
-        };
-
-        console.log('Sending stop recording request with room info:', requestBody);
-
-        const res = await fetch(`${normalizedBackendUrl}/api/video/stop-recording`, {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify(requestBody)
-        });
-        
-        if(!res.ok) {
-          const errorText = await res.text();
-          throw new Error(`Stop failed: ${res.status} ${errorText}`);
-        }
-        
-        const data = await res.json();
-        handleStopResponse(data);
-      } else {
-        // If we don't have both required fields, show a specific error
-        const missingFields = [];
-        if (!roomSid) missingFields.push('RoomSid');
-        if (!resolvedRoomName) missingFields.push('RoomName');
-        throw new Error(`Cannot stop recording: Missing required fields: ${missingFields.join(', ')}`);
+        throw new Error(`Stop failed: ${res.status} ${errorDetails}`);
       }
-    } catch(err){
+      
+      const data = await res.json();
+      
+      // Update state based on response type
+      if (data.type === 'recording') {
+        setRecordingSid(data.recordingSid || data.sid);
+        setRecordingType('recording');
+      } else if (data.type === 'composition') {
+        setCompositionSid(data.compositionSid || data.sid);
+        setRecordingType('composition');
+      }
+      
+      // Handle different statuses
+      if (data.status === 'completed') {
+        // For recordings, we need to use the backend download endpoint
+        const downloadEndpoint = `${normalizedBackendUrl}/api/video/download-recording`;
+        setDownloadUrl(downloadEndpoint);
+        setIsRecording(false);
+        setStatus(`Recording complete (${data.duration}s). Ready for download.`);
+        setRecordingStatus('completed');
+        toast.success('Recording ready for download.');
+        
+        if (recordingCheckIntervalRef.current) {
+          clearInterval(recordingCheckIntervalRef.current);
+          recordingCheckIntervalRef.current = null;
+        }
+      } 
+      else if (data.status === 'enqueued' || data.status === 'processing') {
+        setRecordingStatus(data.status);
+        setStatus(`Recording is ${data.status}. This may take several minutes...`);
+        
+        if (recordingCheckIntervalRef.current) {
+          clearInterval(recordingCheckIntervalRef.current);
+        }
+        
+        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 10000);
+        
+        toast.success(`Recording is being processed. This may take several minutes.`);
+      }
+      else if (data.status === 'failed') {
+        setIsRecording(false);
+        setStatus('Recording failed. Please try again.');
+        setRecordingStatus('failed');
+        toast.error('Recording failed. Please try starting a new recording.');
+        
+        if (recordingCheckIntervalRef.current) {
+          clearInterval(recordingCheckIntervalRef.current);
+          recordingCheckIntervalRef.current = null;
+        }
+      }
+      else {
+        setRecordingStatus(data.status);
+        setStatus(`Recording status: ${data.status}`);
+        
+        if (recordingCheckIntervalRef.current) {
+          clearInterval(recordingCheckIntervalRef.current);
+        }
+        
+        recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(), 5000);
+        
+        toast.success(`Recording status: ${data.status}`);
+      }
+    } catch(err) {
       console.error('Error in stopRecording:', err); 
       setStatus('Error while stopping recording.'); 
       toast.error(err.message); 
-    } finally{ 
+    } finally { 
       setIsRecordingBusy(false); 
-    }
-  };
-
-  const handleStopResponse = (data) => {
-    if (data.status === 'completed' && data.downloadUrl) {
-      setDownloadUrl(data.downloadUrl);
-      setIsRecording(false);
-      setStatus('Recording complete. Ready for download.');
-      toast.success('Recording ready for download.');
-    } else {
-      // If not completed yet, start checking status
-      setStatus(`Recording is ${data.status || 'processing'}...`);
-      if (recordingCheckIntervalRef.current) {
-        clearInterval(recordingCheckIntervalRef.current);
-      }
-      recordingCheckIntervalRef.current = setInterval(() => checkRecordingStatus(data.compositionSid || compositionSid), 5000);
-      toast.info(`Recording is ${data.status || 'processing'}. Download will be available soon.`);
     }
   };
 
   const downloadRecording = async () => {
     if (!downloadUrl) return;
-    await triggerDownloadViaFetch(downloadUrl, `recording_${compositionSid}.mp4`);
+    
+    try {
+      setStatus('Preparing download...');
+      
+      if (recordingType === 'recording' && recordingSid) {
+        // For recordings, use the backend download endpoint with recording SID
+        await triggerDownloadViaFetch(
+          `${normalizedBackendUrl}/api/video/download-recording`,
+          `recording_${recordingSid}.mp4`
+        );
+      } else if (downloadUrl) {
+        // For compositions, use the direct media URL
+        await triggerDownloadViaFetch(downloadUrl, `recording_${compositionSid}.mp4`);
+      } else {
+        throw new Error('No download available');
+      }
+    } catch (err) {
+      console.error('Download error:', err);
+      setStatus('Download failed');
+      toast.error(err.message || 'Download failed');
+    }
+  };
+
+  const refreshRecordingStatus = async () => {
+    if (!recordingSid && !compositionSid) return;
+    await checkRecordingStatus();
+    toast.success('Recording status refreshed');
+  };
+
+  const cleanupStuckRecordings = async () => {
+    try {
+      const res = await fetch(`${normalizedBackendUrl}/api/video/cleanup-recordings`, {
+        method: 'DELETE'
+      });
+      
+      if (res.ok) {
+        toast.success('Cleaned up stuck recordings');
+      } else {
+        toast.error('Cleanup failed');
+      }
+    } catch (err) {
+      console.error('Cleanup error:', err);
+      toast.error('Cleanup failed');
+    }
   };
 
   // --- Render ---
-  const uniqueParticipants = participants.reduce((acc,curr)=>{ if(!acc.some(p=>p.sid===curr.sid)) acc.push(curr); return acc; },[]);
+  const uniqueParticipants = participants.reduce((acc, curr) => {
+    if(!acc.some(p => p.sid === curr.sid)) acc.push(curr); 
+    return acc;
+  }, []);
+
   return (
     <div className="min-h-screen bg-gray-900 flex flex-col">
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-3">
         {/* Video Area */}
         <div className="lg:col-span-2 relative p-2 grid grid-cols-1 md:grid-cols-2 gap-2">
           <AnimatePresence>
-            {uniqueParticipants.length===0 && (<motion.div key="waiting" className="flex items-center justify-center bg-gray-800 text-white col-span-full rounded-lg">{isConnecting?'Connecting...':'Waiting for participants...'}</motion.div>)}
-            {uniqueParticipants.map(p=>(
-              <motion.div key={`participant-${p.sid}`} id={`participant-${p.sid}`} className="relative bg-black rounded-lg overflow-hidden">
-                <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">{p.identity}</span>
+            {uniqueParticipants.length === 0 && (
+              <motion.div 
+                key="waiting" 
+                className="flex items-center justify-center bg-gray-800 text-white col-span-full rounded-lg"
+              >
+                {isConnecting ? 'Connecting...' : 'Waiting for participants...'}
+              </motion.div>
+            )}
+            
+            {uniqueParticipants.map(participant => (
+              <motion.div 
+                key={`participant-${participant.sid}`} 
+                id={`participant-${participant.sid}`} 
+                className="relative bg-black rounded-lg overflow-hidden"
+              >
+                <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">
+                  {participant.identity}
+                </span>
               </motion.div>
             ))}
+            
             <div ref={localVideoRef} className="relative bg-black rounded-lg overflow-hidden">
-              <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">You</span>
+              <span className="absolute bottom-0 left-0 bg-black bg-opacity-50 text-white px-2 py-1 text-sm">
+                You
+              </span>
             </div>
           </AnimatePresence>
         </div>
 
         {/* Chat & Controls */}
         <div className="flex flex-col p-2 space-y-2">
-          <div className="flex-1 overflow-y-auto border rounded p-2" ref={chatScrollRef} onScroll={handleScroll}>
-            {chatMessages.map((msg, idx)=>(
-              <div key={idx} className={`p-1 ${msg.self?'text-right':'text-left'}`}>
-                <div className="inline-block bg-gray-700 text-white px-2 py-1 rounded">{msg.text}</div>
-                <div className="text-xs text-gray-400">{msg.from} • {new Date(msg.timestamp).toLocaleTimeString()}</div>
-              </div>
-            ))}
+          <div className="flex-1 overflow-y-auto border rounded p-2 bg-gray-800" ref={chatScrollRef} onScroll={handleScroll}>
+            {chatMessages.length === 0 ? (
+              <div className="text-gray-400 text-center p-4">No messages yet</div>
+            ) : (
+              chatMessages.map((msg, idx) => (
+                <div key={idx} className={`p-1 ${msg.self ? 'text-right' : 'text-left'}`}>
+                  <div className="inline-block bg-gray-700 text-white px-2 py-1 rounded">
+                    {msg.text}
+                  </div>
+                  <div className="text-xs text-gray-400">
+                    {msg.from} • {new Date(msg.timestamp).toLocaleTimeString()}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
 
-          {showScrollToLatest && <button onClick={scrollToBottom} className="bg-blue-500 text-white p-1 rounded text-sm">Scroll to latest</button>}
+          {showScrollToLatest && (
+            <button 
+              onClick={scrollToBottom} 
+              className="bg-blue-500 text-white p-1 rounded text-sm"
+            >
+              Scroll to latest
+            </button>
+          )}
 
           <div className="flex space-x-2">
-            <input type="text" value={smsInput} onChange={(e)=>setSmsInput(e.target.value)} placeholder="Type a message..." className="flex-1 p-2 rounded"/>
-            <button onClick={sendChat} className="bg-blue-500 p-2 rounded"><Send size={16}/></button>
+            <input 
+              type="text" 
+              value={smsInput} 
+              onChange={(e) => setSmsInput(e.target.value)} 
+              placeholder="Type a message..." 
+              className="flex-1 p-2 rounded bg-gray-700 text-white"
+              onKeyPress={(e) => e.key === 'Enter' && sendChat()}
+            />
+            <button 
+              onClick={sendChat} 
+              className="bg-blue-500 p-2 rounded text-white"
+              disabled={!smsInput.trim()}
+            >
+              <Send size={16}/>
+            </button>
           </div>
 
+          {/* Recording Status Display */}
+          {(recordingStatus || recordingType) && (
+            <div className="p-2 bg-gray-800 rounded text-white text-sm">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span>Type: {recordingType || 'unknown'} | </span>
+                  <span>Status: {recordingStatus || 'checking'}</span>
+                </div>
+                {recordingStatus !== 'completed' && (
+                  <button 
+                    onClick={refreshRecordingStatus}
+                    className="p-1 bg-gray-700 rounded"
+                    title="Refresh status"
+                  >
+                    <RefreshCw size={14} />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="flex space-x-2 justify-center flex-wrap">
-            <button onClick={toggleVideo} className={`p-2 rounded ${isVideoEnabled?'bg-green-600':'bg-gray-600'}`}>{isVideoEnabled?<Video size={16}/>:<VideoOff size={16}/>}</button>
-            <button onClick={toggleAudio} className={`p-2 rounded ${isAudioEnabled?'bg-green-600':'bg-gray-600'}`}>{isAudioEnabled?<Mic size={16}/>:<MicOff size={16}/>}</button>
-            <button onClick={leaveCall} className="p-2 rounded bg-red-600"><PhoneOff size={16}/></button>
-            <button onClick={startRecording} disabled={isRecording || isRecordingBusy} className="p-2 rounded bg-yellow-600">Start Recording</button>
-            <button onClick={stopRecording} disabled={!isRecording || isRecordingBusy} className="p-2 rounded bg-orange-600">Stop Recording</button>
+            <button 
+              onClick={toggleVideo} 
+              className={`p-2 rounded ${isVideoEnabled ? 'bg-green-600' : 'bg-gray-600'} text-white`}
+              title={isVideoEnabled ? 'Turn off video' : 'Turn on video'}
+            >
+              {isVideoEnabled ? <Video size={16}/> : <VideoOff size={16}/>}
+            </button>
+            
+            <button 
+              onClick={toggleAudio} 
+              className={`p-2 rounded ${isAudioEnabled ? 'bg-green-600' : 'bg-gray-600'} text-white`}
+              title={isAudioEnabled ? 'Mute microphone' : 'Unmute microphone'}
+            >
+              {isAudioEnabled ? <Mic size={16}/> : <MicOff size={16}/>}
+            </button>
+            
+            <button 
+              onClick={leaveCall} 
+              className="p-2 rounded bg-red-600 text-white"
+              title="Leave call"
+            >
+              <PhoneOff size={16}/>
+            </button>
+            
+            <button 
+              onClick={startRecording} 
+              disabled={isRecording || isRecordingBusy || !isConnected}
+              className="p-2 rounded bg-yellow-600 text-white disabled:bg-gray-600"
+              title="Start recording"
+            >
+              Start Recording
+            </button>
+            
+            <button 
+              onClick={stopRecording} 
+              disabled={!isRecording || isRecordingBusy}
+              className="p-2 rounded bg-orange-600 text-white disabled:bg-gray-600"
+              title="Stop recording"
+            >
+              Stop Recording
+            </button>
+            
             {downloadUrl && (
-              <button onClick={downloadRecording} className="p-2 rounded bg-green-600">
+              <button 
+                onClick={downloadRecording} 
+                className="p-2 rounded bg-green-600 text-white"
+                title="Download recording"
+              >
                 <Download size={16} />
               </button>
             )}
           </div>
 
-          {status && <div className="text-sm text-white text-center">{status}</div>}
+          {status && (
+            <div className="text-sm text-white text-center p-2 bg-gray-800 rounded">
+              {status}
+            </div>
+          )}
+
+          {error && (
+            <div className="text-sm text-red-400 text-center p-2 bg-gray-800 rounded">
+              Error: {error}
+            </div>
+          )}
         </div>
       </div>
     </div>
