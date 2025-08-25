@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, Download, RefreshCw } from 'lucide-react';
+import { Video, VideoOff, Mic, MicOff, PhoneOff, Send, Download, RefreshCw, FileText, Play, Square } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as signalR from '@microsoft/signalr';
 import { WEBHOOK_CONFIG } from '../config/webhooks';
@@ -45,6 +45,15 @@ const VideoCallPage = ({ identityPrefix }) => {
   const [status, setStatus] = useState(null);
   const [recordingStatus, setRecordingStatus] = useState('');
 
+  // Transcription state
+  const [transcriptionSid, setTranscriptionSid] = useState(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isTranscriptionBusy, setIsTranscriptionBusy] = useState(false);
+  const [transcriptionStatus, setTranscriptionStatus] = useState('');
+  const [transcriptionLanguage, setTranscriptionLanguage] = useState('en-US');
+  const [transcripts, setTranscripts] = useState([]);
+  const [showTranscripts, setShowTranscripts] = useState(false);
+
   const isPatient = identityPrefix === 'patient';
   const backendBaseUrl =
     (WEBHOOK_CONFIG && WEBHOOK_CONFIG.BACKEND_BASE_URL) ||
@@ -65,29 +74,38 @@ const VideoCallPage = ({ identityPrefix }) => {
   };
 
   const cleanupConnections = async () => {
-    try { 
+    try {
       if (roomRef.current) {
-        roomRef.current.disconnect(); 
-        roomRef.current = null; 
+        roomRef.current.disconnect();
+        roomRef.current = null;
       }
     } catch (error) {
       console.warn('Error disconnecting room:', error);
     }
-    
-    try { 
+
+    try {
       if (hubConnectionRef.current) {
-        await hubConnectionRef.current.stop(); 
-        hubConnectionRef.current = null; 
+        await hubConnectionRef.current.stop();
+        hubConnectionRef.current = null;
       }
     } catch (error) {
       console.warn('Error stopping hub connection:', error);
     }
-    
+
     if (recordingCheckIntervalRef.current) {
       clearInterval(recordingCheckIntervalRef.current);
       recordingCheckIntervalRef.current = null;
     }
-    
+
+    // Stop transcription if active
+    if (isTranscribing && !isTranscriptionBusy) {
+      try {
+        await stopTranscription();
+      } catch (error) {
+        console.warn('Error stopping transcription:', error);
+      }
+    }
+
     hasJoinedRef.current = false;
     setIsConnected(false);
   };
@@ -679,6 +697,137 @@ const VideoCallPage = ({ identityPrefix }) => {
     toast.success('Recording status refreshed');
   };
 
+  // --- Transcription handlers ---
+  const startTranscription = async () => {
+    if (isTranscriptionBusy) return;
+    setIsTranscriptionBusy(true);
+
+    try {
+      if (!resolvedRoomName || !roomSid) {
+        throw new Error('Room information not available. Please wait for connection to complete.');
+      }
+
+      const requestBody = {
+        RoomSid: roomSid,
+        RoomName: resolvedRoomName,
+        Language: transcriptionLanguage
+      };
+
+      console.log('Starting transcription with:', requestBody);
+      const res = await fetch(`${normalizedBackendUrl}/api/video/start-transcription`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!res.ok) {
+        let errorDetails = '';
+        try {
+          const errorData = await res.json();
+          errorDetails = errorData.details || errorData.error || JSON.stringify(errorData);
+        } catch {
+          errorDetails = await res.text();
+        }
+        throw new Error(`Start transcription failed: ${res.status} ${errorDetails}`);
+      }
+
+      const data = await res.json();
+      console.log('Start transcription response:', data);
+
+      setTranscriptionSid(data.transcriptionSid);
+      setIsTranscribing(true);
+      setTranscriptionStatus(data.status || 'in-progress');
+      setStatus('Transcription started successfully');
+      toast.success('Transcription started!');
+
+    } catch (err) {
+      console.error('Start transcription error:', err);
+      setStatus(err.message);
+      toast.error(err.message);
+    } finally {
+      setIsTranscriptionBusy(false);
+    }
+  };
+
+  const stopTranscription = async () => {
+    if (isTranscriptionBusy) return;
+    setIsTranscriptionBusy(true);
+
+    try {
+      const requestBody = {
+        TranscriptionSid: transcriptionSid || "",
+        RoomSid: roomSid || "",
+        RoomName: resolvedRoomName || ""
+      };
+
+      console.log('Stopping transcription with:', requestBody);
+      const res = await fetch(`${normalizedBackendUrl}/api/video/stop-transcription`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!res.ok) {
+        let errorDetails = '';
+        try {
+          const errorData = await res.json();
+          errorDetails = errorData.details || errorData.error || JSON.stringify(errorData);
+        } catch {
+          errorDetails = await res.text();
+        }
+        throw new Error(`Stop transcription failed: ${res.status} ${errorDetails}`);
+      }
+
+      const data = await res.json();
+      console.log('Stop transcription response:', data);
+
+      setIsTranscribing(false);
+      setTranscriptionStatus('stopped');
+      setStatus('Transcription stopped');
+      toast.success('Transcription stopped');
+
+      // Fetch final transcripts
+      if (roomSid) {
+        await fetchTranscripts();
+      }
+
+    } catch (err) {
+      console.error('Stop transcription error:', err);
+      setStatus(err.message);
+      toast.error(err.message);
+    } finally {
+      setIsTranscriptionBusy(false);
+    }
+  };
+
+  const fetchTranscripts = async () => {
+    if (!roomSid) return;
+
+    try {
+      const res = await fetch(`${normalizedBackendUrl}/api/video/transcriptions/${roomSid}`);
+      if (res.ok) {
+        const data = await res.json();
+        console.log('Transcripts response:', data);
+        if (data.transcripts && data.transcripts.length > 0) {
+          setTranscripts(data.transcripts);
+          toast.success(`Found ${data.transcripts.length} transcript entries`);
+        } else {
+          toast.info('No transcripts available yet');
+        }
+      }
+    } catch (err) {
+      console.error('Fetch transcripts error:', err);
+      toast.error('Failed to fetch transcripts');
+    }
+  };
+
+  const toggleTranscripts = () => {
+    setShowTranscripts(!showTranscripts);
+    if (!showTranscripts && transcripts.length === 0) {
+      fetchTranscripts();
+    }
+  };
+
   // --- Render ---
   const uniqueParticipants = participants.reduce((acc, curr) => {
     if(!acc.some(p => p.sid === curr.sid)) acc.push(curr); 
@@ -771,11 +920,11 @@ const VideoCallPage = ({ identityPrefix }) => {
             <div className="p-2 bg-gray-800 rounded text-white text-sm">
               <div className="flex items-center justify-between">
                 <div>
-                  <span>Type: {recordingType || 'unknown'} | </span>
+                  <span>Recording - Type: {recordingType || 'unknown'} | </span>
                   <span>Status: {recordingStatus || 'checking'}</span>
                 </div>
                 {recordingStatus !== 'completed' && (
-                  <button 
+                  <button
                     onClick={refreshRecordingStatus}
                     className="p-1 bg-gray-700 rounded"
                     title="Refresh status"
@@ -784,6 +933,51 @@ const VideoCallPage = ({ identityPrefix }) => {
                   </button>
                 )}
               </div>
+            </div>
+          )}
+
+          {/* Transcription Status Display */}
+          {(isTranscribing || transcriptionStatus) && (
+            <div className="p-2 bg-blue-800 rounded text-white text-sm">
+              <div className="flex items-center justify-between">
+                <div>
+                  <span>Transcription - Language: {transcriptionLanguage} | </span>
+                  <span>Status: {transcriptionStatus || 'checking'}</span>
+                  {isTranscribing && <span className="ml-2 animate-pulse">🎤 Live</span>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Transcripts Viewer */}
+          {showTranscripts && (
+            <div className="p-2 bg-gray-800 rounded text-white text-sm max-h-40 overflow-y-auto">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="font-semibold">Transcripts</h4>
+                <button
+                  onClick={fetchTranscripts}
+                  className="p-1 bg-gray-700 rounded"
+                  title="Refresh transcripts"
+                >
+                  <RefreshCw size={14} />
+                </button>
+              </div>
+              {transcripts.length === 0 ? (
+                <div className="text-gray-400 text-center py-2">
+                  No transcripts available yet. Start transcription to see real-time text.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {transcripts.map((transcript, index) => (
+                    <div key={index} className="border-l-2 border-blue-500 pl-2">
+                      <div className="text-xs text-gray-400">
+                        {transcript.participantIdentity || 'Unknown'} • {new Date(transcript.timestamp).toLocaleTimeString()}
+                      </div>
+                      <div className="text-white">{transcript.text}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -831,14 +1025,64 @@ const VideoCallPage = ({ identityPrefix }) => {
             </button>
             
             {downloadUrl && (
-              <button 
-                onClick={downloadRecording} 
+              <button
+                onClick={downloadRecording}
                 className="p-2 rounded bg-green-600 text-white"
                 title="Download recording"
               >
                 <Download size={16} />
               </button>
             )}
+          </div>
+
+          {/* Transcription Controls */}
+          <div className="flex space-x-2 justify-center flex-wrap mt-2">
+            <select
+              value={transcriptionLanguage}
+              onChange={(e) => setTranscriptionLanguage(e.target.value)}
+              className="p-2 rounded bg-gray-700 text-white text-sm"
+              disabled={isTranscribing}
+            >
+              <option value="en-US">English (US)</option>
+              <option value="en-GB">English (UK)</option>
+              <option value="es-ES">Spanish</option>
+              <option value="fr-FR">French</option>
+              <option value="de-DE">German</option>
+              <option value="it-IT">Italian</option>
+              <option value="pt-BR">Portuguese (Brazil)</option>
+              <option value="ja-JP">Japanese</option>
+              <option value="ko-KR">Korean</option>
+              <option value="zh-CN">Chinese (Mandarin)</option>
+            </select>
+
+            <button
+              onClick={startTranscription}
+              disabled={isTranscribing || isTranscriptionBusy || !isConnected}
+              className="p-2 rounded bg-blue-600 text-white disabled:bg-gray-600 text-sm"
+              title="Start transcription"
+            >
+              <Play size={16} className="inline mr-1" />
+              Start Transcription
+            </button>
+
+            <button
+              onClick={stopTranscription}
+              disabled={!isTranscribing || isTranscriptionBusy}
+              className="p-2 rounded bg-red-600 text-white disabled:bg-gray-600 text-sm"
+              title="Stop transcription"
+            >
+              <Square size={16} className="inline mr-1" />
+              Stop Transcription
+            </button>
+
+            <button
+              onClick={toggleTranscripts}
+              className="p-2 rounded bg-purple-600 text-white text-sm"
+              title="View transcripts"
+            >
+              <FileText size={16} className="inline mr-1" />
+              {showTranscripts ? 'Hide' : 'Show'} Transcripts
+            </button>
           </div>
 
           {status && (
