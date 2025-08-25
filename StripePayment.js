@@ -222,32 +222,58 @@ const StripePayment = ({
 
       console.log('✅ Payment method created:', paymentMethod.id);
 
-      // Step 4: Confirm payment with the payment intent
-      console.log('🔐 Confirming payment...');
-      const { error: confirmError, paymentIntent } = await stripe.confirmCardPayment(
-        validatedData.paymentIntent,
-        {
-          payment_method: paymentMethod.id
-        }
+      // Step 4: Check PaymentIntent status and confirm if needed
+      console.log('🔐 Checking PaymentIntent status...');
+
+      // First, retrieve the PaymentIntent to check its current status
+      const { paymentIntent: retrievedPI, error: retrieveError } = await stripe.retrievePaymentIntent(
+        validatedData.paymentIntent
       );
 
-      if (confirmError) {
-        throw new Error(confirmError.message);
+      if (retrieveError) {
+        throw new Error(retrieveError.message);
       }
 
-      if (paymentIntent.status === 'succeeded') {
+      console.log('📊 PaymentIntent status:', retrievedPI.status);
+
+      let finalPaymentIntent = retrievedPI;
+
+      // Only confirm if the PaymentIntent hasn't been confirmed yet
+      if (retrievedPI.status === 'requires_confirmation' || retrievedPI.status === 'requires_payment_method') {
+        console.log('🔐 PaymentIntent requires confirmation, confirming now...');
+
+        const { error: confirmError, paymentIntent: confirmedPI } = await stripe.confirmCardPayment(
+          validatedData.paymentIntent,
+          {
+            payment_method: paymentMethod.id
+          }
+        );
+
+        if (confirmError) {
+          throw new Error(confirmError.message);
+        }
+
+        finalPaymentIntent = confirmedPI;
+        console.log('✅ Payment confirmed successfully!');
+      } else if (retrievedPI.status === 'succeeded') {
+        console.log('✅ Payment already succeeded - no confirmation needed!');
+      } else {
+        throw new Error(`PaymentIntent has unexpected status: ${retrievedPI.status}`);
+      }
+
+      if (finalPaymentIntent.status === 'succeeded') {
         console.log('✅ Payment successful!');
 
         // Pass the validated data along with payment info
         onPaymentSuccess({
           paymentMethod,
-          paymentIntent,
+          paymentIntent: finalPaymentIntent,
           amount,
           currency: 'eur',
           stripeData: validatedData
         });
       } else {
-        throw new Error(`Payment failed with status: ${paymentIntent.status}`);
+        throw new Error(`Payment failed with status: ${finalPaymentIntent.status}`);
       }
 
     } catch (err) {
