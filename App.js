@@ -1961,20 +1961,21 @@ export default function CareHQBooking() {
     try {
       // Extract Stripe payment data for ccTrnNo and trnDate
       const stripeData = paymentResult.stripeData || {};
-      const paymentIntent = stripeData.paymentIntent || paymentResult.paymentIntent?.id || '';
+      const chargeID = stripeData.chargeID || stripeData.chargeId || '';
       const createdAt = stripeData.createdAt || paymentResult.paymentIntent?.created
         ? new Date(paymentResult.paymentIntent.created * 1000).toISOString()
         : new Date().toISOString();
 
       console.log('💳 Extracted Stripe data for booking:', {
-        paymentIntent,
+        chargeID,
         createdAt,
+        stripeData,
         fullPaymentResult: paymentResult
       });
 
       // Store Stripe payment data for later use
       setStripePaymentData({
-        ccTrnNo: paymentIntent,
+        ccTrnNo: chargeID,
         trnDate: createdAt
       });
 
@@ -1994,7 +1995,7 @@ export default function CareHQBooking() {
           "Status": true, // True to confirm booking after payment
           "Email": formData.email || "",
           "VideoURL": "",
-          "ccTrnNo": paymentIntent, // Payment intent from Stripe
+          "ccTrnNo": chargeID, // Charge ID from Stripe workflow
           "trnDate": createdAt // Transaction date from Stripe
         };
 
@@ -2215,8 +2216,8 @@ export default function CareHQBooking() {
         "EndTime": reservedAppointment.EndTime,
         "Status": true,
         "VideoURL": "",
-        "ccTrnNo": stripePaymentData?.ccTrnNo || "", // Payment intent from Stripe
-        "trnDate": stripePaymentData?.trnDate || null // Transaction date from Stripe
+        "ccTrnNo": stripePaymentData?.ccTrnNo || "", // Charge ID from Stripe workflow
+        "trnDate": stripePaymentData?.trnDate || null // Transaction date from Stripe workflow
       };
 
       console.log('📤 Directions request payload:', directionsPayload);
