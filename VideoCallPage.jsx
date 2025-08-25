@@ -720,6 +720,22 @@ const VideoCallPage = ({ identityPrefix }) => {
         throw new Error('Speech recognition not supported in this browser. Please use Chrome, Edge, or Safari.');
       }
 
+      // Check microphone permission first
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach(track => track.stop()); // Stop the stream immediately
+        console.log('Microphone permission granted');
+      } catch (permissionError) {
+        console.error('Microphone permission error:', permissionError);
+        if (permissionError.name === 'NotAllowedError') {
+          throw new Error('Microphone access denied. Please allow microphone access in your browser and try again.');
+        } else if (permissionError.name === 'NotFoundError') {
+          throw new Error('No microphone found. Please connect a microphone and try again.');
+        } else {
+          throw new Error(`Microphone error: ${permissionError.message}`);
+        }
+      }
+
       const requestBody = {
         RoomSid: roomSid,
         RoomName: resolvedRoomName,
@@ -809,7 +825,16 @@ const VideoCallPage = ({ identityPrefix }) => {
       recognition.onerror = (event) => {
         console.error('Speech recognition error:', event.error);
         if (event.error === 'not-allowed') {
-          toast.error('Microphone access denied. Please allow microphone access and try again.');
+          setIsTranscribing(false);
+          setTranscriptionStatus('permission-denied');
+          setStatus('Microphone access denied');
+          toast.error('Microphone access denied. Please allow microphone access in your browser settings and try again.');
+        } else if (event.error === 'no-speech') {
+          toast.error('No speech detected. Please speak closer to your microphone.');
+        } else if (event.error === 'audio-capture') {
+          toast.error('No microphone found. Please check your microphone connection.');
+        } else if (event.error === 'network') {
+          toast.error('Network error occurred during speech recognition.');
         } else {
           toast.error(`Speech recognition error: ${event.error}`);
         }
@@ -915,7 +940,7 @@ const VideoCallPage = ({ identityPrefix }) => {
           setTranscripts(data.transcripts);
           toast.success(`Found ${data.transcripts.length} transcript entries`);
         } else {
-          toast.info('No transcripts available yet');
+          toast.success('No transcripts available yet');
         }
       }
     } catch (err) {
@@ -1041,14 +1066,30 @@ const VideoCallPage = ({ identityPrefix }) => {
 
           {/* Transcription Status Display */}
           {(isTranscribing || transcriptionStatus) && (
-            <div className="p-2 bg-blue-800 rounded text-white text-sm">
+            <div className={`p-2 rounded text-white text-sm ${
+              transcriptionStatus === 'permission-denied' ? 'bg-red-800' : 'bg-blue-800'
+            }`}>
               <div className="flex items-center justify-between">
                 <div>
                   <span>Transcription - Language: {transcriptionLanguage} | </span>
                   <span>Status: {transcriptionStatus || 'checking'}</span>
                   {isTranscribing && <span className="ml-2 animate-pulse">🎤 Live</span>}
+                  {transcriptionStatus === 'permission-denied' && (
+                    <span className="ml-2 text-red-200">❌ Permission Required</span>
+                  )}
                 </div>
               </div>
+              {/* Permission help */}
+              {transcriptionStatus === 'permission-denied' && (
+                <div className="mt-2 p-2 bg-red-700 rounded text-xs">
+                  <div className="text-red-200">To enable transcription:</div>
+                  <div className="text-white">
+                    1. Click the microphone icon in your browser's address bar<br/>
+                    2. Select "Allow" for microphone access<br/>
+                    3. Refresh the page and try again
+                  </div>
+                </div>
+              )}
               {/* Current transcript (interim results) */}
               {currentTranscript && (
                 <div className="mt-2 p-2 bg-blue-700 rounded text-xs">
@@ -1077,7 +1118,12 @@ const VideoCallPage = ({ identityPrefix }) => {
               </div>
               {transcripts.length === 0 ? (
                 <div className="text-gray-400 text-center py-4">
-                  {isTranscribing ? (
+                  {transcriptionStatus === 'permission-denied' ? (
+                    <div>
+                      <div className="text-red-400">❌ Microphone access required</div>
+                      <div className="text-xs mt-1">Please allow microphone access to enable transcription</div>
+                    </div>
+                  ) : isTranscribing ? (
                     <div>
                       <div className="animate-pulse">🎤 Listening for speech...</div>
                       <div className="text-xs mt-1">Speak into your microphone to see transcripts here</div>
@@ -1185,10 +1231,10 @@ const VideoCallPage = ({ identityPrefix }) => {
               onClick={startTranscription}
               disabled={isTranscribing || isTranscriptionBusy || !isConnected}
               className="p-2 rounded bg-blue-600 text-white disabled:bg-gray-600 text-sm"
-              title="Start transcription"
+              title={!isConnected ? "Connect to room first" : "Start transcription"}
             >
               <Play size={16} className="inline mr-1" />
-              Start Transcription
+              {isTranscriptionBusy ? 'Starting...' : 'Start Transcription'}
             </button>
 
             <button
