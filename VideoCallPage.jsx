@@ -53,6 +53,8 @@ const VideoCallPage = ({ identityPrefix }) => {
   const [transcriptionLanguage, setTranscriptionLanguage] = useState('en-US');
   const [transcripts, setTranscripts] = useState([]);
   const [showTranscripts, setShowTranscripts] = useState(false);
+  const [speechRecognition, setSpeechRecognition] = useState(null);
+  const [currentTranscript, setCurrentTranscript] = useState('');
 
   const isPatient = identityPrefix === 'patient';
   const backendBaseUrl =
@@ -100,7 +102,13 @@ const VideoCallPage = ({ identityPrefix }) => {
     // Stop transcription if active
     if (isTranscribing && !isTranscriptionBusy) {
       try {
-        await stopTranscription();
+        if (speechRecognition) {
+          speechRecognition.stop();
+          setSpeechRecognition(null);
+        }
+        setIsTranscribing(false);
+        setTranscriptionStatus('stopped');
+        setCurrentTranscript('');
       } catch (error) {
         console.warn('Error stopping transcription:', error);
       }
@@ -707,6 +715,11 @@ const VideoCallPage = ({ identityPrefix }) => {
         throw new Error('Room information not available. Please wait for connection to complete.');
       }
 
+      // Check if browser supports Web Speech API
+      if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+        throw new Error('Speech recognition not supported in this browser. Please use Chrome, Edge, or Safari.');
+      }
+
       const requestBody = {
         RoomSid: roomSid,
         RoomName: resolvedRoomName,
@@ -734,11 +747,94 @@ const VideoCallPage = ({ identityPrefix }) => {
       const data = await res.json();
       console.log('Start transcription response:', data);
 
+      // Initialize Web Speech API
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const recognition = new SpeechRecognition();
+
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = transcriptionLanguage;
+
+      recognition.onstart = () => {
+        console.log('Speech recognition started');
+        setTranscriptionStatus('listening');
+        setStatus('🎤 Listening for speech...');
+      };
+
+      recognition.onresult = async (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript;
+          } else {
+            interimTranscript += transcript;
+          }
+        }
+
+        // Update current transcript display
+        setCurrentTranscript(interimTranscript);
+
+        // Store final transcripts
+        if (finalTranscript) {
+          const newTranscript = {
+            text: finalTranscript,
+            participantIdentity: identity || 'You',
+            timestamp: new Date().toISOString(),
+            isFinal: true
+          };
+
+          setTranscripts(prev => [...prev, newTranscript]);
+
+          // Send to backend for storage
+          try {
+            await fetch(`${normalizedBackendUrl}/api/video/store-transcript`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                roomSid: roomSid,
+                text: finalTranscript,
+                participantIdentity: identity || 'You',
+                isFinal: true
+              })
+            });
+          } catch (err) {
+            console.error('Failed to store transcript:', err);
+          }
+        }
+      };
+
+      recognition.onerror = (event) => {
+        console.error('Speech recognition error:', event.error);
+        if (event.error === 'not-allowed') {
+          toast.error('Microphone access denied. Please allow microphone access and try again.');
+        } else {
+          toast.error(`Speech recognition error: ${event.error}`);
+        }
+      };
+
+      recognition.onend = () => {
+        console.log('Speech recognition ended');
+        if (isTranscribing) {
+          // Restart if still transcribing
+          setTimeout(() => {
+            if (isTranscribing) {
+              recognition.start();
+            }
+          }, 100);
+        }
+      };
+
+      setSpeechRecognition(recognition);
+      recognition.start();
+
       setTranscriptionSid(data.transcriptionSid);
       setIsTranscribing(true);
-      setTranscriptionStatus(data.status || 'in-progress');
-      setStatus('Transcription started successfully');
-      toast.success('Transcription started!');
+      setTranscriptionStatus('listening');
+      setStatus('🎤 Real-time transcription started');
+      toast.success('Real-time transcription started!');
 
     } catch (err) {
       console.error('Start transcription error:', err);
@@ -754,6 +850,12 @@ const VideoCallPage = ({ identityPrefix }) => {
     setIsTranscriptionBusy(true);
 
     try {
+      // Stop Web Speech API
+      if (speechRecognition) {
+        speechRecognition.stop();
+        setSpeechRecognition(null);
+      }
+
       const requestBody = {
         TranscriptionSid: transcriptionSid || "",
         RoomSid: roomSid || "",
@@ -783,6 +885,7 @@ const VideoCallPage = ({ identityPrefix }) => {
 
       setIsTranscribing(false);
       setTranscriptionStatus('stopped');
+      setCurrentTranscript('');
       setStatus('Transcription stopped');
       toast.success('Transcription stopped');
 
@@ -946,36 +1049,59 @@ const VideoCallPage = ({ identityPrefix }) => {
                   {isTranscribing && <span className="ml-2 animate-pulse">🎤 Live</span>}
                 </div>
               </div>
+              {/* Current transcript (interim results) */}
+              {currentTranscript && (
+                <div className="mt-2 p-2 bg-blue-700 rounded text-xs">
+                  <div className="text-blue-200">Currently speaking:</div>
+                  <div className="text-white italic">"{currentTranscript}"</div>
+                </div>
+              )}
             </div>
           )}
 
           {/* Transcripts Viewer */}
           {showTranscripts && (
-            <div className="p-2 bg-gray-800 rounded text-white text-sm max-h-40 overflow-y-auto">
+            <div className="p-2 bg-gray-800 rounded text-white text-sm max-h-60 overflow-y-auto">
               <div className="flex items-center justify-between mb-2">
-                <h4 className="font-semibold">Transcripts</h4>
+                <h4 className="font-semibold">
+                  Transcripts ({transcripts.length})
+                  {isTranscribing && <span className="ml-2 text-green-400">● Recording</span>}
+                </h4>
                 <button
                   onClick={fetchTranscripts}
-                  className="p-1 bg-gray-700 rounded"
+                  className="p-1 bg-gray-700 rounded hover:bg-gray-600"
                   title="Refresh transcripts"
                 >
                   <RefreshCw size={14} />
                 </button>
               </div>
               {transcripts.length === 0 ? (
-                <div className="text-gray-400 text-center py-2">
-                  No transcripts available yet. Start transcription to see real-time text.
+                <div className="text-gray-400 text-center py-4">
+                  {isTranscribing ? (
+                    <div>
+                      <div className="animate-pulse">🎤 Listening for speech...</div>
+                      <div className="text-xs mt-1">Speak into your microphone to see transcripts here</div>
+                    </div>
+                  ) : (
+                    <div>
+                      <div>No transcripts available yet.</div>
+                      <div className="text-xs mt-1">Start transcription to see real-time text.</div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-2">
                   {transcripts.map((transcript, index) => (
-                    <div key={index} className="border-l-2 border-blue-500 pl-2">
-                      <div className="text-xs text-gray-400">
-                        {transcript.participantIdentity || 'Unknown'} • {new Date(transcript.timestamp).toLocaleTimeString()}
+                    <div key={index} className="border-l-2 border-blue-500 pl-2 py-1">
+                      <div className="text-xs text-gray-400 flex items-center justify-between">
+                        <span>{transcript.participantIdentity || 'Unknown'}</span>
+                        <span>{new Date(transcript.timestamp).toLocaleTimeString()}</span>
                       </div>
-                      <div className="text-white">{transcript.text}</div>
+                      <div className="text-white mt-1">{transcript.text}</div>
                     </div>
                   ))}
+                  {/* Auto-scroll to bottom */}
+                  <div ref={(el) => el?.scrollIntoView({ behavior: 'smooth' })} />
                 </div>
               )}
             </div>

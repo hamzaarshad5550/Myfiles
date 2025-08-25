@@ -865,12 +865,6 @@ namespace TwilioOpenAppointement.Controllers
                 if (string.IsNullOrWhiteSpace(request.RoomName) && string.IsNullOrWhiteSpace(request.RoomSid))
                     return BadRequest("RoomName or RoomSid is required.");
 
-                var accountSid = _config["TwilioSettings:AccountSID"];
-                var authToken = _config["TwilioSettings:AuthToken"];
-
-                if (string.IsNullOrEmpty(accountSid) || string.IsNullOrEmpty(authToken))
-                    return StatusCode(500, "Twilio configuration is missing.");
-
                 string? resolvedRoomSid = request.RoomSid;
 
                 if (string.IsNullOrWhiteSpace(resolvedRoomSid))
@@ -883,51 +877,21 @@ namespace TwilioOpenAppointement.Controllers
                         return BadRequest("Could not find room.");
                 }
 
-                var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
+                // Since Twilio Video doesn't have real-time transcription API,
+                // we'll use browser-based Web Speech API for real-time transcription
+                // and Twilio Conversational Intelligence for post-call transcription
 
-                // Start transcription for the room
-                var transcriptionUrl = "https://video.twilio.com/v1/Transcriptions";
-                var transcriptionContent = new Dictionary<string, string>
+                Console.WriteLine($"Browser-based transcription enabled for room {resolvedRoomSid}");
+
+                return Ok(new
                 {
-                    { "RoomSid", resolvedRoomSid },
-                    { "Language", request.Language },
-                    { "StatusCallback", $"{Request.Scheme}://{Request.Host}/api/video/transcription-callback" }
-                };
-
-                using var requestMessage = new HttpRequestMessage(HttpMethod.Post, transcriptionUrl);
-                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-                requestMessage.Content = new FormUrlEncodedContent(transcriptionContent);
-
-                var response = await _httpClient.SendAsync(requestMessage);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var respJson = await response.Content.ReadAsStringAsync();
-                    using var transcriptionDoc = JsonDocument.Parse(respJson);
-                    var transcriptionSid = transcriptionDoc.RootElement.GetProperty("sid").GetString();
-                    var status = transcriptionDoc.RootElement.GetProperty("status").GetString();
-
-                    Console.WriteLine($"Transcription started for room {resolvedRoomSid}: {transcriptionSid}");
-
-                    return Ok(new
-                    {
-                        transcriptionSid = transcriptionSid,
-                        roomSid = resolvedRoomSid,
-                        status = status,
-                        language = request.Language,
-                        message = "Transcription started successfully"
-                    });
-                }
-                else
-                {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine($"Failed to start transcription: {errorContent}");
-                    return StatusCode((int)response.StatusCode, new
-                    {
-                        error = "Failed to start transcription",
-                        details = errorContent
-                    });
-                }
+                    transcriptionSid = $"browser-{Guid.NewGuid()}",
+                    roomSid = resolvedRoomSid,
+                    status = "browser-ready",
+                    language = request.Language,
+                    type = "browser",
+                    message = "Browser-based transcription ready. Real-time transcription will use Web Speech API."
+                });
             }
             catch (Exception ex)
             {
@@ -947,100 +911,34 @@ namespace TwilioOpenAppointement.Controllers
             {
                 if (request == null) return BadRequest("Request body is missing.");
 
-                var accountSid = _config["TwilioSettings:AccountSID"];
-                var authToken = _config["TwilioSettings:AuthToken"];
-
-                if (string.IsNullOrEmpty(accountSid) || string.IsNullOrEmpty(authToken))
-                    return StatusCode(500, "Twilio configuration is missing.");
-
-                var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
-
-                // If we have a specific transcription SID, stop it
-                if (!string.IsNullOrWhiteSpace(request.TranscriptionSid))
+                // For browser-based transcription, we just acknowledge the stop request
+                if (!string.IsNullOrWhiteSpace(request.TranscriptionSid) && request.TranscriptionSid.StartsWith("browser-"))
                 {
-                    var stopUrl = $"https://video.twilio.com/v1/Transcriptions/{request.TranscriptionSid}";
-                    var stopContent = new Dictionary<string, string>
+                    Console.WriteLine($"Browser transcription {request.TranscriptionSid} stopped");
+                    return Ok(new
                     {
-                        { "Status", "stopped" }
-                    };
-
-                    using var stopRequest = new HttpRequestMessage(HttpMethod.Post, stopUrl);
-                    stopRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-                    stopRequest.Content = new FormUrlEncodedContent(stopContent);
-
-                    var stopResponse = await _httpClient.SendAsync(stopRequest);
-
-                    if (stopResponse.IsSuccessStatusCode)
-                    {
-                        Console.WriteLine($"Transcription {request.TranscriptionSid} stopped successfully");
-                        return Ok(new
-                        {
-                            transcriptionSid = request.TranscriptionSid,
-                            status = "stopped",
-                            message = "Transcription stopped successfully"
-                        });
-                    }
-                    else
-                    {
-                        var errorContent = await stopResponse.Content.ReadAsStringAsync();
-                        Console.WriteLine($"Failed to stop transcription {request.TranscriptionSid}: {errorContent}");
-                        return StatusCode((int)stopResponse.StatusCode, new
-                        {
-                            error = "Failed to stop transcription",
-                            details = errorContent
-                        });
-                    }
+                        transcriptionSid = request.TranscriptionSid,
+                        status = "stopped",
+                        type = "browser",
+                        message = "Browser transcription stopped successfully"
+                    });
                 }
 
-                // If no specific SID, try to find and stop transcriptions for the room
+                // For future Twilio-based transcription (when available)
                 string resolvedRoomSid = request.RoomSid;
                 if (string.IsNullOrWhiteSpace(resolvedRoomSid) && !string.IsNullOrWhiteSpace(request.RoomName))
                 {
                     resolvedRoomSid = await GetRoomSid(request.RoomName);
                 }
 
-                if (!string.IsNullOrWhiteSpace(resolvedRoomSid))
-                {
-                    var transcriptionsUrl = $"https://video.twilio.com/v1/Transcriptions?RoomSid={resolvedRoomSid}&Status=in-progress";
-                    using var listRequest = new HttpRequestMessage(HttpMethod.Get, transcriptionsUrl);
-                    listRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-
-                    var listResponse = await _httpClient.SendAsync(listRequest);
-                    if (listResponse.IsSuccessStatusCode)
-                    {
-                        var listJson = await listResponse.Content.ReadAsStringAsync();
-                        using var listDoc = JsonDocument.Parse(listJson);
-                        var transcriptionsArray = listDoc.RootElement.GetProperty("transcriptions").EnumerateArray();
-
-                        foreach (var transcription in transcriptionsArray)
-                        {
-                            var transcriptionSid = transcription.GetProperty("sid").GetString();
-                            var stopUrl = $"https://video.twilio.com/v1/Transcriptions/{transcriptionSid}";
-                            var stopContent = new Dictionary<string, string>
-                            {
-                                { "Status", "stopped" }
-                            };
-
-                            using var stopRequest = new HttpRequestMessage(HttpMethod.Post, stopUrl);
-                            stopRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-                            stopRequest.Content = new FormUrlEncodedContent(stopContent);
-
-                            await _httpClient.SendAsync(stopRequest);
-                        }
-
-                        return Ok(new
-                        {
-                            roomSid = resolvedRoomSid,
-                            status = "stopped",
-                            message = "All transcriptions for room stopped successfully"
-                        });
-                    }
-                }
+                Console.WriteLine($"Transcription stopped for room {resolvedRoomSid}");
 
                 return Ok(new
                 {
+                    roomSid = resolvedRoomSid,
                     status = "stopped",
-                    message = "No active transcriptions found"
+                    type = "browser",
+                    message = "Transcription stopped successfully"
                 });
             }
             catch (Exception ex)
@@ -1055,44 +953,31 @@ namespace TwilioOpenAppointement.Controllers
         }
 
         [HttpGet("transcription-status/{sid}")]
-        public async Task<IActionResult> GetTranscriptionStatus(string sid)
+        public IActionResult GetTranscriptionStatus(string sid)
         {
             if (string.IsNullOrWhiteSpace(sid))
                 return BadRequest("Transcription SID is required.");
 
             try
             {
-                var accountSid = _config["TwilioSettings:AccountSID"];
-                var authToken = _config["TwilioSettings:AuthToken"];
-                var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
-
-                var transcriptionUrl = $"https://video.twilio.com/v1/Transcriptions/{sid}";
-
-                using var requestMessage = new HttpRequestMessage(HttpMethod.Get, transcriptionUrl);
-                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-
-                var response = await _httpClient.SendAsync(requestMessage);
-                if (!response.IsSuccessStatusCode)
+                // Handle browser-based transcription
+                if (sid.StartsWith("browser-"))
                 {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine($"Failed to fetch transcription {sid}: {errorContent}");
-                    return StatusCode((int)response.StatusCode, "Failed to fetch transcription status.");
+                    return Ok(new TranscriptionStatusResponse
+                    {
+                        Status = "browser-active",
+                        Sid = sid,
+                        RoomSid = ""
+                    });
                 }
 
-                var transcriptionJson = await response.Content.ReadAsStringAsync();
-                using var transcriptionDoc = JsonDocument.Parse(transcriptionJson);
-                var status = transcriptionDoc.RootElement.GetProperty("status").GetString();
-                var roomSid = transcriptionDoc.RootElement.TryGetProperty("room_sid", out var roomElem) ?
-                             roomElem.GetString() : "";
-
-                var transcriptionResponse = new TranscriptionStatusResponse
+                // For future Twilio-based transcription (when available)
+                return Ok(new TranscriptionStatusResponse
                 {
-                    Status = status,
+                    Status = "not-supported",
                     Sid = sid,
-                    RoomSid = roomSid
-                };
-
-                return Ok(transcriptionResponse);
+                    RoomSid = ""
+                });
             }
             catch (Exception ex)
             {
@@ -1101,71 +986,68 @@ namespace TwilioOpenAppointement.Controllers
             }
         }
 
+        // Store browser-based transcripts
+        private static readonly Dictionary<string, List<TranscriptionText>> _browserTranscripts = new();
+
+        [HttpPost("store-transcript")]
+        public IActionResult StoreTranscript([FromBody] JsonElement payload)
+        {
+            try
+            {
+                var roomSid = payload.GetProperty("roomSid").GetString();
+                var text = payload.GetProperty("text").GetString();
+                var participantIdentity = payload.TryGetProperty("participantIdentity", out var identityElem) ?
+                                        identityElem.GetString() : "Unknown";
+                var isFinal = payload.TryGetProperty("isFinal", out var finalElem) ?
+                            finalElem.GetBoolean() : true;
+
+                if (string.IsNullOrWhiteSpace(roomSid) || string.IsNullOrWhiteSpace(text))
+                    return BadRequest("RoomSid and text are required.");
+
+                if (!_browserTranscripts.ContainsKey(roomSid))
+                {
+                    _browserTranscripts[roomSid] = new List<TranscriptionText>();
+                }
+
+                _browserTranscripts[roomSid].Add(new TranscriptionText
+                {
+                    Text = text,
+                    ParticipantSid = "",
+                    ParticipantIdentity = participantIdentity,
+                    Timestamp = DateTime.UtcNow,
+                    IsFinal = isFinal
+                });
+
+                Console.WriteLine($"Stored transcript for room {roomSid}: {text}");
+
+                return Ok(new { message = "Transcript stored successfully" });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"StoreTranscript error: {ex}");
+                return StatusCode(500, new { error = "Internal server error", details = ex.Message });
+            }
+        }
+
         [HttpGet("transcriptions/{roomSid}")]
-        public async Task<IActionResult> GetRoomTranscriptions(string roomSid)
+        public IActionResult GetRoomTranscriptions(string roomSid)
         {
             if (string.IsNullOrWhiteSpace(roomSid))
                 return BadRequest("Room SID is required.");
 
             try
             {
-                var accountSid = _config["TwilioSettings:AccountSID"];
-                var authToken = _config["TwilioSettings:AuthToken"];
-                var authHeader = Convert.ToBase64String(Encoding.ASCII.GetBytes($"{accountSid}:{authToken}"));
-
-                var transcriptionsUrl = $"https://video.twilio.com/v1/Transcriptions?RoomSid={roomSid}";
-
-                using var requestMessage = new HttpRequestMessage(HttpMethod.Get, transcriptionsUrl);
-                requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-
-                var response = await _httpClient.SendAsync(requestMessage);
-                if (!response.IsSuccessStatusCode)
-                {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine($"Failed to fetch transcriptions for room {roomSid}: {errorContent}");
-                    return StatusCode((int)response.StatusCode, "Failed to fetch transcriptions.");
-                }
-
-                var transcriptionsJson = await response.Content.ReadAsStringAsync();
-                using var transcriptionsDoc = JsonDocument.Parse(transcriptionsJson);
-                var transcriptionsArray = transcriptionsDoc.RootElement.GetProperty("transcriptions").EnumerateArray();
-
+                // Get browser-based transcripts
                 var transcripts = new List<TranscriptionText>();
-                foreach (var transcription in transcriptionsArray)
+
+                if (_browserTranscripts.ContainsKey(roomSid))
                 {
-                    var transcriptionSid = transcription.GetProperty("sid").GetString();
-                    var status = transcription.GetProperty("status").GetString();
-
-                    // Get transcription text if available
-                    if (status == "completed")
-                    {
-                        var textUrl = $"https://video.twilio.com/v1/Transcriptions/{transcriptionSid}/Text";
-                        using var textRequest = new HttpRequestMessage(HttpMethod.Get, textUrl);
-                        textRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
-
-                        var textResponse = await _httpClient.SendAsync(textRequest);
-                        if (textResponse.IsSuccessStatusCode)
-                        {
-                            var textJson = await textResponse.Content.ReadAsStringAsync();
-                            using var textDoc = JsonDocument.Parse(textJson);
-
-                            if (textDoc.RootElement.TryGetProperty("text", out var textArray))
-                            {
-                                foreach (var textItem in textArray.EnumerateArray())
-                                {
-                                    transcripts.Add(new TranscriptionText
-                                    {
-                                        Text = textItem.TryGetProperty("text", out var textProp) ? textProp.GetString() : "",
-                                        ParticipantSid = textItem.TryGetProperty("participant_sid", out var sidProp) ? sidProp.GetString() : "",
-                                        ParticipantIdentity = textItem.TryGetProperty("participant_identity", out var identityProp) ? identityProp.GetString() : "",
-                                        Timestamp = textItem.TryGetProperty("timestamp", out var timestampProp) ?
-                                                   DateTime.Parse(timestampProp.GetString() ?? DateTime.UtcNow.ToString()) : DateTime.UtcNow,
-                                        IsFinal = textItem.TryGetProperty("is_final", out var finalProp) ? finalProp.GetBoolean() : true
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    transcripts = _browserTranscripts[roomSid];
+                    Console.WriteLine($"Retrieved {transcripts.Count} browser transcripts for room {roomSid}");
+                }
+                else
+                {
+                    Console.WriteLine($"No browser transcripts found for room {roomSid}");
                 }
 
                 return Ok(new TranscriptionStatusResponse
