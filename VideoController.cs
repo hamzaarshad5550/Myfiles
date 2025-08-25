@@ -387,15 +387,15 @@ namespace TwilioOpenAppointement.Controllers
                             Console.WriteLine($"Composition {request.CompositionSid} is stuck in enqueued with 0 duration. Checking for room recordings...");
 
                             // Try to find room recordings as fallback
-                            string resolvedRoomSid = request.RoomSid;
-                            if (string.IsNullOrWhiteSpace(resolvedRoomSid) && !string.IsNullOrWhiteSpace(request.RoomName))
+                            string fallbackRoomSid = request.RoomSid; // CHANGED: Renamed variable
+                            if (string.IsNullOrWhiteSpace(fallbackRoomSid) && !string.IsNullOrWhiteSpace(request.RoomName))
                             {
-                                resolvedRoomSid = await GetRoomSid(request.RoomName);
+                                fallbackRoomSid = await GetRoomSid(request.RoomName);
                             }
 
-                            if (!string.IsNullOrWhiteSpace(resolvedRoomSid))
+                            if (!string.IsNullOrWhiteSpace(fallbackRoomSid))
                             {
-                                var recordingsUrl = $"https://video.twilio.com/v1/Recordings?RoomSid={resolvedRoomSid}&Status=completed&PageSize=10";
+                                var recordingsUrl = $"https://video.twilio.com/v1/Recordings?RoomSid={fallbackRoomSid}&Status=completed&PageSize=10";
                                 using var recordingsRequest = new HttpRequestMessage(HttpMethod.Get, recordingsUrl);
                                 recordingsRequest.Headers.Authorization = new AuthenticationHeaderValue("Basic", authHeader);
 
